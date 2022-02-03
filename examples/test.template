@@ -1,0 +1,4 @@
+[main settings]
+the_thing = 123
+foo = buzz
+hey = "what's up?"
