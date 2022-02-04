@@ -24,5 +24,5 @@ setup(
     name='fscm',
     py_modules=['fscm'],
     url='https://github.com/jamesob/fscm',
-    version='0.0.1',
+    version='0.0.2',
 )
