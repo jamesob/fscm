@@ -735,7 +735,7 @@ def chown(
 ) -> ChangeList:
     """Change a path's owner."""
     path = _to_path(path)
-    needs_sudo_w = needs_sudo_to_write(path)
+    needs_sudo_w = need_sudo_to_write(path)
     needs_sudo_r = need_sudo_to_read(path)
 
     if needs_sudo_r and not sudo:
@@ -961,7 +961,10 @@ def need_sudo_to_read(path: Pathable) -> bool:
 def need_sudo_to_write(path: Pathable) -> bool:
     path = _to_path(path)
     try:
-        return not (path.exists() and os.access(path, os.W_OK))
+        if not path.exists():
+            # Check the containing dir for perms
+            path = path.parent
+        return not os.access(path, os.W_OK)
     except PermissionError:
         return True
 
