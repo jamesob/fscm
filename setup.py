@@ -22,7 +22,7 @@ setup(
     long_description_content_type='text/markdown',
     keywords='fscm',
     name='fscm',
-    py_modules=['fscm'],
+    packages=['fscm'],
     url='https://github.com/jamesob/fscm',
-    version='0.0.2',
+    version='0.0.3',
 )
