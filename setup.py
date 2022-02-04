@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 with open('README.md') as readme_file:
     readme = readme_file.read()
@@ -22,7 +22,7 @@ setup(
     long_description_content_type='text/markdown',
     keywords='fscm',
     name='fscm',
-    packages=['fscm'],
+    packages=find_packages(),
     url='https://github.com/jamesob/fscm',
-    version='0.0.3',
+    version='0.0.4',
 )
