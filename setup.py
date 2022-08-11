@@ -24,5 +24,12 @@ setup(
     name='fscm',
     packages=find_packages(),
     url='https://github.com/jamesob/fscm',
+    extras_require={
+        'mitogen': [
+            # Fork of mitogen required to support pickling whitelist.
+            # See https://github.com/mitogen-hq/mitogen/pull/953
+            'mitogen @ git+ssh://git@github.com/jamesob/mitogen.git'
+        ],
+    },
     version='0.0.4',
 )
