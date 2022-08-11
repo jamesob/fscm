@@ -1,14 +1,14 @@
-"""Main module."""
+# TODO: figure out global default su strategy
 import os
 import hashlib
 import os.path
 import subprocess
 import time
+import ast
 import re
 import textwrap
 import threading
 import difflib
-import json
 import inspect
 import socket
 import datetime
@@ -29,10 +29,11 @@ from .thirdparty import color as c
 
 HAS_MITOGEN = True
 try:
-    import mitogen.master
-    import mitogen.utils
+    import mitogen  # noqa
 except ImportError:
     HAS_MITOGEN = False
+else:
+    from .remote import *
 
 logger = logging.getLogger("fscm")
 
@@ -160,6 +161,7 @@ class OutputStreamer(threading.Thread):
     This mimics the file interface and can be passed to
     subprocess.Popen({stdout,stderr}=...).
     """
+
     def __init__(
         self, *, is_stdout: bool = True, capture: bool = True, quiet: bool = False
     ):
@@ -213,8 +215,8 @@ class RunReturn:
         if self.returncode != 0:
             raise RuntimeError(
                 f"command failed unexpectedly (code {self.returncode})"
-                f"\nstdout:\n{self.stdout.decode()}\n\n"
-                f"\nstderr:\n{self.stderr.decode()}\n"
+                f"\nstdout:\n{self.stdout}\n\n"
+                f"\nstderr:\n{self.stderr}\n"
             )
         return self
 
@@ -260,7 +262,7 @@ def get_secrets(
     assert sek
 
     try:
-        loaded = json.loads(sek)
+        loaded = ast.literal_eval(sek)
     except Exception:
         logger.exception(
             f"failed to deserialize secrets from {pass_key if pass_key else 'env'}"
@@ -323,51 +325,10 @@ def _pytest_extract_dict_subset():
     assert newns == _dict_into_ns({"a": {"b": 2, "c": 3, "x": 2}})
 
 
-if HAS_MITOGEN:
-
-    @contextmanager
-    def mitogen_router():
-        broker = mitogen.master.Broker()
-        router = mitogen.master.Router(broker)
-        try:
-            yield router
-        finally:
-            broker.shutdown()
-            broker.join()
-
-    def get_mitogen_context(router, hostname, *args, log_level="INFO", **kwargs):
-        kwargs.setdefault("python_path", ["/usr/bin/env", "python3"])
-        mitogen.utils.log_to_file(level=log_level)
-        settings.output.log(f"SSHing to {hostname}, may require auth...")
-        context = (
-            router.local(*args, **kwargs)
-            if hostname == "localhost"
-            else router.ssh(*args, hostname=hostname, **kwargs)
-        )
-        # router.enable_debug()
-        return context
-
-    @contextmanager
-    def mitogen_context(hostname, *args, log_level="INFO", router=None, **kwargs):
-        kwargs.setdefault("python_path", ["/usr/bin/env", "python3"])
-        mitogen.utils.log_to_file(level=log_level)
-
-        with mitogen_router() as router:
-            settings.output.log(f"SSHing to {hostname}, may require auth...")
-            context = (
-                router.local(*args, **kwargs)
-                if hostname == "localhost"
-                else router.ssh(hostname=hostname, *args, **kwargs)
-            )
-            # router.enable_debug()
-            yield (router, context)
-
-
 @dataclass
 class SymlinkAdd(Change):
     target: str
     linkname: str
-
     msg: str = "link {linkname} -> {target}"
 
 
@@ -376,7 +337,6 @@ class SymlinkModify(Change):
     target: str
     old_target: str
     linkname: str
-
     msg: str = "modify link {linkname} -> {target}"
 
 
@@ -436,12 +396,30 @@ class SymlinkFailure(Exception):
 @dataclass
 class PkgAdd(Change):
     pkg_name: str
-    msg: str = "system package added: {pkg_name}"
+    version: str
+    source: str
+    msg: str = "package {pkg_name} added from {source}: {version}"
 
 
+@dataclass
 class PkgRm(Change):
     pkg_name: str
     msg: str = "system package removed: {pkg_name}"
+
+
+@dataclass
+class PkgUpgrade(Change):
+    pkg_name: str
+    old_ver: str
+    new_ver: str
+    msg: str = "package {pkg_name} upgraded: {old_ver} -> {new_ver}"
+
+
+@dataclass
+class UserGroupAdd(Change):
+    user: str
+    group_name: str
+    msg: str = "user {user} added to group {group_name}"
 
 
 class Debian(UnixSystem):
@@ -478,19 +456,26 @@ class Debian(UnixSystem):
 
         return False
 
-    def pkg_install(self, name: str) -> ChangeList:
+    def pkg_install(self, name: str, sudo: bool = True) -> ChangeList:
         if not self.pkg_is_installed(name):
-            ensure_sudo("apt-get update")
-            _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=True, check=True)
+            if sudo:
+                ensure_sudo("apt-get update")
+            _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
             _run(
                 f"DEBIAN_FRONTEND=noninteractive apt-get install -q --yes {name}",
-                sudo=True,
+                sudo=sudo,
                 check=True,
             )
-            return [cl(PkgAdd, name)]
+            return [cl(PkgAdd, name, self.pkg_get_installed_version(name), "apt")]
         return []
 
-    def pkgs_install(self, *names) -> ChangeList:
+    def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
+        output = run(f'dpkg -s {name} | grep "^Version: "').stdout
+        if "Version: " not in output:
+            return None
+        return output.split("Version: ")[-1].strip()
+
+    def pkgs_install(self, *names, sudo: bool = True) -> ChangeList:
         allnames = []
         for n in names:
             allnames.extend([i.strip() for i in n.split()])
@@ -499,52 +484,70 @@ class Debian(UnixSystem):
         if not uninstalled:
             return []
 
-        ensure_sudo("apt-get update")
-        _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=True, check=True)
+        if sudo:
+            ensure_sudo("apt-get update")
+        _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
         _run(
             f"DEBIAN_FRONTEND=noninteractive "
             f"apt-get install --yes {' '.join(uninstalled)}",
-            sudo=True,
+            sudo=sudo,
             check=True,
         )
 
-        return [cl(PkgAdd, n) for n in uninstalled]
+        added = []
+        for n in uninstalled:
+            added.append(cl(PkgAdd, n, self.pkg_get_installed_version(n), "apt"))
+        return added
 
-    def add_apt_source(self, source_name: str, line: str) -> ChangeList:
-        return file_(
+    def add_apt_source(
+        self, source_name: str, line: str, sudo: bool = True
+    ) -> ChangeList:
+        return file(
             f"/etc/apt/sources.list.d/{source_name}.list",
             content=line,
             mode="755",
-            sudo=True,
+            sudo=sudo,
         )
 
     def apt_add_repo(
-        self, repo_name: str, source_created_str: str, keyname: t.Optional[str] = None
+        self,
+        repo_name: str,
+        source_created_str: str,
+        keyname: t.Optional[str] = None,
+        sudo: bool = True,
     ) -> ChangeList:
         changes = []
         changes.extend(self.pkg_install("software-properties-common"))
 
         if not Path(f"/etc/apt/sources.list.d/{source_created_str}").exists():
             changes.extend(
-                run(f"add-apt-repository -y {repo_name}", check=True, sudo=True)
+                run(f"add-apt-repository -y {repo_name}", check=True, sudo=sudo)
             )
 
             if keyname:
                 changes.extend(self.apt_add_key(keyname))
 
-            _run("apt update", sudo=True, check=True)
+            _run("apt update", sudo=sudo, check=True)
         return changes
 
     def apt_add_key(self, keyname: str) -> ChangeList:
         return run(
-            f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}"
+            f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}",
+            sudo=True
         )
 
-    def service_start(self, service_name: str, enable: bool = False):
-        run("systemctl daemon-reload", sudo=True)
-        run(f"systemctl start {service_name}", sudo=True)
+    def service_start(self, service_name: str, enable: bool = False, sudo: bool = True):
+        run("systemctl daemon-reload", sudo=sudo)
+        run(f"systemctl start {service_name}", sudo=sudo)
         if enable:
-            run(f"systemctl enable {service_name}.service", sudo=True)
+            run(f"systemctl enable {service_name}.service", sudo=sudo)
+
+    def group_member(self, user: str, group: str) -> ChangeList:
+        """Ensure a user's membership in a group."""
+        if group in run(f'groups {user}', quiet=True).stdout.split():
+            return []
+        run(f'usermod -aG {group} {user}', sudo=True)
+        return [cl(UserGroupAdd, user, group)]
 
 
 system = Debian()
@@ -628,28 +631,6 @@ class DirAdd(Change):
     msg: str = "mkdir {path}"
 
 
-def mkdir(
-    p: Pathable,
-    mode: t.Optional[str] = None,
-    owner: t.Optional[str] = None,
-    sudo: bool = False,
-    **kwargs,
-) -> ChangeList:
-    changes = []
-    kwargs.setdefault("parents", True)
-    kwargs.setdefault("exist_ok", True)
-    p = _to_path(p)
-    exists = p.exists()
-    if mode:
-        changes.extend(chmod(p, mode, sudo=sudo))
-    if owner:
-        changes.extend(chown(p, owner, sudo=sudo))
-
-    if not exists:
-        changes.append(cl(DirAdd, p))
-    return changes
-
-
 def _to_path(path: Pathable) -> Path:
     return path if isinstance(path, Path) else Path(path)
 
@@ -706,17 +687,24 @@ def make_executable(path: Pathable, sudo: bool = False) -> ChangeList:
 
 
 def chmod(
-    path: Pathable, mode: str, flags: t.Optional[str] = None, sudo: bool = False
+    path: Pathable,
+    mode: t.Union[str, int],
+    flags: t.Optional[str] = None,
+    sudo: bool = False,
 ) -> ChangeList:
     """Change a path's mode (permissions)."""
     path = _to_path(path)
+    flags = flags or ""
     curr_mode = get_file_mode(path, sudo)
     needs_sudo = need_sudo_to_write(path)
+
+    if not isinstance(mode, str):
+        mode = str(mode)
 
     if curr_mode != mode:
         if needs_sudo and not sudo:
             raise NeedsSudoException(f"chmod {mode} {path}")
-        _run(f"chmod {flags} {mode}", sudo=needs_sudo, check=True)
+        _run(f"chmod {flags} {mode} {path}", sudo=needs_sudo, check=True)
         return [cl(ChmodModify, path, mode, curr_mode, flags)]
     return []
 
@@ -735,15 +723,20 @@ def chown(
 ) -> ChangeList:
     """Change a path's owner."""
     path = _to_path(path)
+    # TODO fails when changing to root:root from a user who can write
     needs_sudo_w = need_sudo_to_write(path)
     needs_sudo_r = need_sudo_to_read(path)
+    flags = flags or ""
+
+    if owner.split(":")[0].startswith("root"):
+        needs_sudo_w = True
 
     if needs_sudo_r and not sudo:
         raise NeedsSudoException(f"chown {path}")
 
     curr_owner = _run(
-        f"stat -c '%U:%G' {path}", check=True, sudo=needs_sudo_r
-    ).stdout.decode.strip()
+        f"stat -c '%U:%G' {path}", check=True, sudo=needs_sudo_r, quiet=True
+    ).stdout.strip()
 
     if ":" not in curr_owner:
         curr_owner = curr_owner.split(":", 1)[0]
@@ -751,17 +744,25 @@ def chown(
     if curr_owner != owner:
         if needs_sudo_w and not sudo:
             raise NeedsSudoException(f"chown {owner} {path}")
-        _run(f"chown {flags} {owner}", sudo=needs_sudo_w, check=True)
+        _run(f"chown {flags} {owner} {path}", sudo=needs_sudo_w, check=True)
         return [cl(ChownModify, path, owner, curr_owner, flags)]
     return []
 
 
-def _run(
+def run(
     cmd: str, check: bool = False, quiet: bool = False, capture: bool = True, **kwargs
 ) -> RunReturn:
-    """Run a command, capturing output and in shell mode by default."""
+    """
+    Run a command, capturing output and in shell mode by default.
+
+    'q' is also a kwarg alias for quiet.
+    """
+    cmd = cmd.strip()
     kwargs.setdefault("text", True)
     kwargs.setdefault("shell", True)
+
+    if "q" in kwargs:
+        quiet = bool(kwargs.pop("q"))
 
     stdout = OutputStreamer(quiet=quiet, capture=capture)
     stderr = OutputStreamer(is_stdout=False, quiet=quiet, capture=capture)
@@ -782,6 +783,11 @@ def _run(
 
     start = time.time()
 
+    def to_s(s) -> str:
+        if isinstance(s, bytes):
+            return s.decode()
+        return s
+
     with subprocess.Popen(cmd, **kwargs) as s:
         stdout.close()
         stderr.close()
@@ -789,7 +795,10 @@ def _run(
         stderr.join()
         s.wait()
         r = RunReturn(
-            s.args, s.returncode, "".join(stdout.lines), "".join(stderr.lines)
+            s.args,
+            s.returncode,
+            to_s("".join(stdout.lines)),
+            to_s("".join(stderr.lines)),
         )
 
     end = time.time()
@@ -815,7 +824,7 @@ def _run(
     return r
 
 
-run = _run
+_run = run
 
 
 def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
@@ -841,17 +850,26 @@ def ensure_sudo(for_cmd: str):
     subprocess.run("sudo -S true", shell=True)
 
 
-def dir(
+class DirectoryExistsError(Exception):
+    pass
+
+
+def mkdir(
     path: Pathable,
     mode: t.Optional[str] = None,
     owner: t.Optional[str] = None,
     sudo: bool = False,
+    parents: bool = True,
+    exist_ok: bool = True,
 ):
     changes = []
     path = _to_path(path)
+    parents_flag = '-p' if parents else ''
+
     if not path.exists():
-        _run(f"mkdir -p {path}", sudo=sudo)
-        changes.append(cl(DirAdd, path))
+        _run(f"mkdir {parents_flag} {path}", check=True, sudo=sudo)
+    elif not exist_ok:
+        raise DirectoryExistsError(path)
 
     if mode:
         changes.extend(chmod(path, mode))
@@ -865,7 +883,7 @@ def file_exists_sudo(path: t.Union[str, Path]):
     return _run(f"test -e {path}", quiet=True, sudo=True).ok
 
 
-def file_(
+def file(
     path: Pathable,
     content: t.Union[str, Path],
     mode: str = None,
@@ -880,6 +898,9 @@ def file_(
     if isinstance(content, Path):
         content = content.read_text()
 
+    if not content.endswith("\n"):
+        content += "\n"
+
     def set_perms(p: Pathable) -> ChangeList:
         cs = []
         if mode:
@@ -888,20 +909,15 @@ def file_(
             cs.extend(chown(p, owner, sudo=sudo))
         return cs
 
-    needs_sudo_r = False
-    try:
-        exists = path.exists()
-    except PermissionError:
-        needs_sudo_r = True
+    if needs_sudo_r := need_sudo_to_read(path):
         if sudo:
             exists = file_exists_sudo(path)
         else:
             raise FscmException("can't detect file {path} without sudo")
+    else:
+        exists = path.exists()
 
     if exists:
-        if needs_sudo_r and not sudo:
-            raise NeedsSudoException(f"can't read file {path} without sudo")
-
         txt = None
         if needs_sudo_r:
             txt = _run(f"cat {path}", sudo=True, quiet=True).stdout
@@ -932,10 +948,9 @@ def file_(
     # New file
 
     if sudo:
-        tmp = _get_tempfile(path if exists else None)
-        set_perms(tmp)
-        # Important to set perms before we write the contents.
+        tmp = _get_tempfile(path if exists else None, sudo)
         tmp.write_text(content)
+        set_perms(tmp)
 
         _run(f"mv {tmp} {path}", sudo=True)
     else:
@@ -950,12 +965,18 @@ def file_(
     return changes
 
 
+# TODO remove this old name
+file_ = file
+
+
 def need_sudo_to_read(path: Pathable) -> bool:
+    p = _to_path(path)
     try:
-        Path(path).exists()
+        exists = p.exists()
     except PermissionError:
         return True
-    return False
+
+    return not os.access(p if exists else p.parent, os.R_OK)
 
 
 def need_sudo_to_write(path: Pathable) -> bool:
@@ -1056,9 +1077,9 @@ def lineinfile(
     if not modified:
         return []
 
-    tmp = _get_tempfile(target)
+    tmp = _get_tempfile(target, sudo)
     chmod(tmp, get_file_mode(path, sudo))
-    tmp.write_text("\n".join(newlines) + '\n')
+    tmp.write_text("\n".join(newlines) + "\n")
 
     _run(f"mv {tmp} {path}", sudo=sudo)
     if sudo:
@@ -1069,11 +1090,11 @@ def lineinfile(
     return [cl(FileModify, path)]
 
 
-def _get_tempfile(like_path: t.Optional[Path] = None) -> Path:
+def _get_tempfile(like_path: t.Optional[Path] = None, sudo: bool = False) -> Path:
     p = Path(tempfile.mkstemp()[1])
 
     if like_path:
-        p.chmod(int(get_file_mode(like_path), 8))
+        p.chmod(int(get_file_mode(like_path, sudo), 8))
 
     return p
 
@@ -1202,3 +1223,50 @@ def print_slow_commands():
 
     for cmd, time in cmds[:25]:
         settings.output.log(f"{time:<20.2} {cmd:<30}")
+
+
+@dataclass
+class PathHelper:
+    path: Path
+    sudo: bool | None = None
+    changes: t.List[ChangeList] = field(default_factory=list)
+
+    def rm(self, flags: str = "", **kwargs) -> 'PathHelper':
+        kwargs = self._fill_default_kwargs(kwargs)
+
+        if self.path.exists():
+            run(f"rm {flags} {self.path}", **kwargs)
+            self.changes.append([FileRm(str(self.path))])
+        return self
+
+    def contents(self, *args, **kwargs) -> 'PathHelper':
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.append(file_(self.path, *args, **kwargs))
+        return self
+
+    content = contents
+
+    def chmod(self, *args, **kwargs) -> 'PathHelper':
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.append(chmod(self.path, *args, **kwargs))
+        return self
+
+    def chown(self, *args, **kwargs) -> 'PathHelper':
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.append(chown(self.path, *args, **kwargs))
+        return self
+
+    def mkdir(self, *args, **kwargs) -> 'PathHelper':
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.append(mkdir(self.path, *args, **kwargs))
+        return self
+
+    def _fill_default_kwargs(self, kwargs: dict) -> dict:
+        if self.sudo is not None and 'sudo' not in kwargs:
+            kwargs['sudo'] = self.sudo
+        return kwargs
+
+
+
+def p(pathlike: t.Union[Path, str], *args, **kwargs) -> PathHelper:
+    return PathHelper(Path(pathlike), *args, **kwargs)
