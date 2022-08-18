@@ -34,6 +34,7 @@ except ImportError:
     HAS_MITOGEN = False
 else:
     from .remote import *
+    from fscm import remote
 
 logger = logging.getLogger("fscm")
 
@@ -87,6 +88,28 @@ class Settings:
     dry: bool = False
     output: OutputHandler = field(default_factory=OutputHandler)
     container_cmd: str = field(default="docker")
+
+    # If specified, automatially piped into `sudo -S | [cmd]` for any command requiring
+    # privilege escalation.
+    sudo_password: t.Optional[str] = None
+
+    def __repr__(self):
+        def hide(k, v):
+            return '[hidden]' if k in {'sudo_password'} else v
+
+        attrs = ", ".join(
+            "%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items()
+        )
+        return f"{self.__class__.__name__}({attrs})"
+
+    def get_cached_sudo_password(self) -> t.Optional[str]:
+        cached_from_remote = None
+        if HAS_MITOGEN:
+            assert remote
+            cached_from_remote = remote.CACHED_SUDO_PASSWORD
+
+        return self.sudo_password or cached_from_remote
+
 
 
 settings = Settings(
@@ -161,7 +184,6 @@ class OutputStreamer(threading.Thread):
     This mimics the file interface and can be passed to
     subprocess.Popen({stdout,stderr}=...).
     """
-
     def __init__(
         self, *, is_stdout: bool = True, capture: bool = True, quiet: bool = False
     ):
@@ -230,7 +252,7 @@ def check_fail(cmd: str, *args, **kwargs) -> bool:
     kwargs["check"] = False
     kwargs["quiet"] = True
 
-    return _run(cmd, *args, **kwargs).returncode != 0
+    return run(cmd, *args, **kwargs).returncode != 0
 
 
 @contextmanager
@@ -258,7 +280,7 @@ def get_secrets(
     out = SimpleNamespace()
     if not sek and pass_key:
         settings.output.log(f"requesting secrets from {pass_key}")
-        sek = _run(f"pass show {pass_key}", quiet=True).assert_ok.stdout
+        sek = run(f"pass show {pass_key}", quiet=True).assert_ok.stdout
     assert sek
 
     try:
@@ -356,7 +378,7 @@ class UnixSystem:
 
         if needs_sudo_for_read:
             if exists := file_exists_sudo(dest):
-                current_target = _run(f"readlink {dest}", sudo=sudo).stdout or None
+                current_target = run(f"readlink {dest}", sudo=sudo).stdout or None
         else:
             if exists := (dest := Path(dest)).exists():
                 try:
@@ -368,10 +390,10 @@ class UnixSystem:
             raise FscmException(f"installing link to {dest} requires sudo")
         else:
             if not exists:
-                _run(f"ln {flags} {target} {dest}", sudo=needs_sudo_for_write)
+                run(f"ln {flags} {target} {dest}", sudo=needs_sudo_for_write)
                 return [cl(SymlinkAdd, str(target), str(dest))]
             elif overwrite and current_target != target:
-                _run(
+                run(
                     f"rm {dest} && ln {flags} {target} {dest}",
                     sudo=needs_sudo_for_write,
                 )
@@ -380,13 +402,13 @@ class UnixSystem:
         return []
 
     def is_installed(self, name: str) -> bool:
-        return _run(f"which {name}", quiet=True).ok
+        return run(f"which {name}", quiet=True).ok
 
     def is_debian(self) -> bool:
-        return _run("uname -a | grep Debian").ok
+        return run("uname -a | grep Debian").ok
 
     def is_ubuntu(self) -> bool:
-        return _run("uname -a | grep Ubuntu").ok
+        return run("uname -a | grep Ubuntu").ok
 
 
 class SymlinkFailure(Exception):
@@ -429,18 +451,18 @@ class Debian(UnixSystem):
 
         Get the bare-minimum on target host to be able to run mitogen.
         """
-        ok = _run(f'ssh {username}@{hostname} "which python3"', quiet=True).ok
+        ok = run(f'ssh {username}@{hostname} "which python3"', quiet=True).ok
 
         if not ok:
             settings.output.log(f"bootstrapping host {hostname!r}")
-            _run(
+            run(
                 f"ssh {username}@{hostname} "
                 '"sudo apt-get update; sudo apt install -y python3 apt"',
                 check=True,
             )
 
     def pkg_is_installed(self, name: str) -> bool:
-        ret = _run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'", quiet=True)
+        ret = run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'", quiet=True)
 
         if not ret.ok:
             return False
@@ -458,10 +480,8 @@ class Debian(UnixSystem):
 
     def pkg_install(self, name: str, sudo: bool = True) -> ChangeList:
         if not self.pkg_is_installed(name):
-            if sudo:
-                ensure_sudo("apt-get update")
-            _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
-            _run(
+            run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
+            run(
                 f"DEBIAN_FRONTEND=noninteractive apt-get install -q --yes {name}",
                 sudo=sudo,
                 check=True,
@@ -484,10 +504,8 @@ class Debian(UnixSystem):
         if not uninstalled:
             return []
 
-        if sudo:
-            ensure_sudo("apt-get update")
-        _run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
-        _run(
+        run("DEBIAN_FRONTEND=noninteractive apt-get update", sudo=sudo, check=True)
+        run(
             f"DEBIAN_FRONTEND=noninteractive "
             f"apt-get install --yes {' '.join(uninstalled)}",
             sudo=sudo,
@@ -527,7 +545,7 @@ class Debian(UnixSystem):
             if keyname:
                 changes.extend(self.apt_add_key(keyname))
 
-            _run("apt update", sudo=sudo, check=True)
+            run("apt update", sudo=sudo, check=True)
         return changes
 
     def apt_add_key(self, keyname: str) -> ChangeList:
@@ -562,7 +580,7 @@ class Docker:
     """Tested with podman also."""
 
     def volume_exists(self, name: str) -> bool:
-        vols = _run(
+        vols = run(
             '%s volume ls --filter "name=%s"' % (settings.container_cmd, name),
             quiet=True,
         ).stdout.strip()
@@ -573,7 +591,7 @@ class Docker:
         return run(f"{settings.container_cmd} volume create {name}")
 
     def _find_container(self, name: str) -> RunReturn:
-        return _run(
+        return run(
             '%s ps -a --filter "name=%s" --format "{{.Status}}"'
             % (settings.container_cmd, name),
             quiet=True,
@@ -586,7 +604,7 @@ class Docker:
         return bool(self._find_container(name).stdout.strip())
 
     def image_exists(self, name: str) -> bool:
-        return _run(
+        return run(
             f'%s image list | grep "^{name} "' % settings.container_cmd, quiet=True
         ).ok
 
@@ -614,7 +632,7 @@ class Pip:
         if self.pkg_is_installed(pkg_name):
             return []
 
-        _run(f"pip install {pkg_name}", check=True)
+        run(f"pip install {pkg_name}", check=True)
         return [cl(PipPkgAdd, pkg_name)]
 
 
@@ -647,7 +665,7 @@ def get_file_mode_user(path: Pathable) -> str:
 
 def get_file_mode_sudo(path: Pathable) -> str:
     """Returns a string like '700'."""
-    return _run(f"stat -c '%a' {path}", quiet=True, sudo=True).stdout.strip()
+    return run(f"stat -c '%a' {path}", quiet=True, sudo=True).stdout.strip()
 
 
 def get_file_mode(path: Pathable, sudo: bool = False) -> str:
@@ -681,7 +699,7 @@ def make_executable(path: Pathable, sudo: bool = False) -> ChangeList:
     if not is_file_executable(path):
         if needs_sudo_w and not sudo:
             raise NeedsSudoException(f"chmod +x {path}")
-        _run(f"chmod +x {path}", check=True, sudo=needs_sudo_w)
+        run(f"chmod +x {path}", check=True, sudo=needs_sudo_w)
         return [cl(ChmodExecAdd, path)]
     return []
 
@@ -704,7 +722,7 @@ def chmod(
     if curr_mode != mode:
         if needs_sudo and not sudo:
             raise NeedsSudoException(f"chmod {mode} {path}")
-        _run(f"chmod {flags} {mode} {path}", sudo=needs_sudo, check=True)
+        run(f"chmod {flags} {mode} {path}", sudo=needs_sudo, check=True)
         return [cl(ChmodModify, path, mode, curr_mode, flags)]
     return []
 
@@ -734,7 +752,7 @@ def chown(
     if needs_sudo_r and not sudo:
         raise NeedsSudoException(f"chown {path}")
 
-    curr_owner = _run(
+    curr_owner = run(
         f"stat -c '%U:%G' {path}", check=True, sudo=needs_sudo_r, quiet=True
     ).stdout.strip()
 
@@ -744,7 +762,7 @@ def chown(
     if curr_owner != owner:
         if needs_sudo_w and not sudo:
             raise NeedsSudoException(f"chown {owner} {path}")
-        _run(f"chown {flags} {owner} {path}", sudo=needs_sudo_w, check=True)
+        run(f"chown {flags} {owner} {path}", sudo=needs_sudo_w, check=True)
         return [cl(ChownModify, path, owner, curr_owner, flags)]
     return []
 
@@ -770,11 +788,18 @@ def run(
     kwargs["stderr"] = stderr
 
     sudo = bool(kwargs.pop("sudo", False))
+    cached_sudo_password = None
 
     if sudo:
         settings.output.alert(f"running sudo: {cmd}")
-        ensure_sudo(cmd)
-        cmd = f'sudo bash -c "{cmd}"'
+        if (cached_sudo_password := settings.get_cached_sudo_password()):
+            cmd = f'sudo -S -- bash -c "{cmd}"'
+            if 'stdin' in kwargs:
+                raise ValueError("can't pass stdin when using sudo -S")
+            kwargs['stdin'] = subprocess.PIPE
+        else:
+            ensure_sudo(cmd)
+            cmd = f'sudo bash -c "{cmd}"'
 
     r = None
 
@@ -789,6 +814,10 @@ def run(
         return s
 
     with subprocess.Popen(cmd, **kwargs) as s:
+        if sudo and cached_sudo_password:
+            assert s.stdin
+            s.stdin.write(f'{cached_sudo_password}\n')
+            s.stdin.close()
         stdout.close()
         stderr.close()
         stdout.join()
@@ -824,14 +853,11 @@ def run(
     return r
 
 
-_run = run
-
-
 def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
     out = []
 
     for cmd in _split_cmd_input(cmds):
-        r = _run(cmd, **kwargs)
+        r = run(cmd, **kwargs)
         out.append(r)
 
         if check and not r.ok:
@@ -842,7 +868,7 @@ def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
 
 def ensure_sudo(for_cmd: str):
     """Ensure we have sudo, prompting otherwise."""
-    if _run("sudo -S true </dev/null", quiet=True).ok:
+    if run("sudo -S true </dev/null", quiet=True).ok:
         # Sudo is cached
         return
     settings.output.alert(f"requesting sudo for {for_cmd!r}")
@@ -867,7 +893,7 @@ def mkdir(
     parents_flag = '-p' if parents else ''
 
     if not path.exists():
-        _run(f"mkdir {parents_flag} {path}", check=True, sudo=sudo)
+        run(f"mkdir {parents_flag} {path}", check=True, sudo=sudo)
     elif not exist_ok:
         raise DirectoryExistsError(path)
 
@@ -880,7 +906,7 @@ def mkdir(
 
 
 def file_exists_sudo(path: t.Union[str, Path]):
-    return _run(f"test -e {path}", quiet=True, sudo=True).ok
+    return run(f"test -e {path}", quiet=True, sudo=True).ok
 
 
 def file(
@@ -920,7 +946,7 @@ def file(
     if exists:
         txt = None
         if needs_sudo_r:
-            txt = _run(f"cat {path}", sudo=True, quiet=True).stdout
+            txt = run(f"cat {path}", sudo=True, quiet=True).stdout
         else:
             txt = path.read_text()
 
@@ -952,9 +978,9 @@ def file(
         tmp.write_text(content)
         set_perms(tmp)
 
-        _run(f"mv {tmp} {path}", sudo=True)
+        run(f"mv {tmp} {path}", sudo=True)
     else:
-        _run(f"touch {path}")
+        run(f"touch {path}")
         set_perms(path)
         # Important to set perms before we write the contents.
         path.write_text(content)
@@ -1081,10 +1107,10 @@ def lineinfile(
     chmod(tmp, get_file_mode(path, sudo))
     tmp.write_text("\n".join(newlines) + "\n")
 
-    _run(f"mv {tmp} {path}", sudo=sudo)
+    run(f"mv {tmp} {path}", sudo=sudo)
     if sudo:
         # TODO fix this
-        _run(f"chown root:root {path}", sudo=sudo)
+        run(f"chown root:root {path}", sudo=sudo)
 
     # TODO - implement diff
     return [cl(FileModify, path)]
@@ -1228,7 +1254,7 @@ def print_slow_commands():
 @dataclass
 class PathHelper:
     path: Path
-    sudo: bool | None = None
+    sudo: t.Optional[bool] = None
     changes: t.List[ChangeList] = field(default_factory=list)
 
     def rm(self, flags: str = "", **kwargs) -> 'PathHelper':
