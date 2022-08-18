@@ -417,11 +417,11 @@ def boot_child_and_call(host: Host, to_parent: mitogen.core.Sender, fnc, *args, 
     argspec = inspect.getfullargspec(fnc)
     parent = Parent.from_sender(to_parent)
 
-    if host.secrets.sudo_password:
+    if (sudo_password := getattr(host.secrets, 'sudo_password', None)):
         # This value will be detected and made use of in
         # `fscm.Settings.get_cached_sudo_password()`.
         global CACHED_SUDO_PASSWORD
-        CACHED_SUDO_PASSWORD = host.secrets.sudo_password
+        CACHED_SUDO_PASSWORD = sudo_password
 
     if 'parent' in argspec.args:
         kwargs['parent'] = parent
