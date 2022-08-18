@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from contextlib import contextmanager
 from urllib.parse import unquote, urlparse
 import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from string import Template
@@ -853,6 +854,12 @@ def run(
     return r
 
 
+def getstdout(*args, **kwargs) -> str:
+    """A shorthand for quietly (by default) getting stdout from a shell command."""
+    kwargs.setdefault('quiet', True)
+    return run(*args, **kwargs).stdout.strip()
+
+
 def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
     out = []
 
@@ -1226,7 +1233,22 @@ def download_and_check_sha(url: str, sha256: str) -> Path:
     output_path = topath / end
 
     if not output_path.exists():
-        urllib.request.urlretrieve(url, filename=output_path)
+        tries = 3
+        sleep_secs = 0.5
+
+        while tries > 0:
+            try:
+                urllib.request.urlretrieve(url, filename=output_path)
+            except urllib.error.URLError as e:
+                if tries <= 0 or 'Device or resource busy' not in str(e):
+                    raise
+                logger.exception(f'Hit "device busy" when retrieving {url}')
+                tries -= 1
+                time.sleep(sleep_secs)
+                sleep_secs *= 2
+            else:
+                break
+
 
     sha = hashlib.sha256()
 
