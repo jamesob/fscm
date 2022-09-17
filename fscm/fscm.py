@@ -1,4 +1,6 @@
 # TODO: figure out global default su strategy
+# TODO: "version control"-ish file backup option
+# TODO: document sudo requirement
 import os
 import hashlib
 import os.path
@@ -10,12 +12,15 @@ import textwrap
 import threading
 import difflib
 import inspect
+import getpass
 import socket
 import datetime
 import logging
+import pwd
 import sys
 import tempfile
 import typing as t
+from textwrap import dedent
 from types import SimpleNamespace
 from contextlib import contextmanager
 from urllib.parse import unquote, urlparse
@@ -86,7 +91,8 @@ class Settings:
     stream_output: bool
     # If true, don't actually execute anything - make a best effort to log what we
     # would've done.
-    dry: bool = False
+    # TODO
+    # dry: bool = False
     output: OutputHandler = field(default_factory=OutputHandler)
     container_cmd: str = field(default="docker")
 
@@ -96,11 +102,9 @@ class Settings:
 
     def __repr__(self):
         def hide(k, v):
-            return '[hidden]' if k in {'sudo_password'} else v
+            return "[hidden]" if k in {"sudo_password"} else v
 
-        attrs = ", ".join(
-            "%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items()
-        )
+        attrs = ", ".join("%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items())
         return f"{self.__class__.__name__}({attrs})"
 
     def get_cached_sudo_password(self) -> t.Optional[str]:
@@ -110,7 +114,6 @@ class Settings:
             cached_from_remote = remote.CACHED_SUDO_PASSWORD
 
         return self.sudo_password or cached_from_remote
-
 
 
 settings = Settings(
@@ -185,6 +188,7 @@ class OutputStreamer(threading.Thread):
     This mimics the file interface and can be passed to
     subprocess.Popen({stdout,stderr}=...).
     """
+
     def __init__(
         self, *, is_stdout: bool = True, capture: bool = True, quiet: bool = False
     ):
@@ -233,7 +237,6 @@ class RunReturn:
     def ok(self):
         return self.returncode == 0
 
-    @property
     def assert_ok(self):
         if self.returncode != 0:
             raise RuntimeError(
@@ -281,7 +284,7 @@ def get_secrets(
     out = SimpleNamespace()
     if not sek and pass_key:
         settings.output.log(f"requesting secrets from {pass_key}")
-        sek = run(f"pass show {pass_key}", quiet=True).assert_ok.stdout
+        sek = run(f"pass show {pass_key}", quiet=True).assert_ok().stdout
     assert sek
 
     try:
@@ -552,7 +555,7 @@ class Debian(UnixSystem):
     def apt_add_key(self, keyname: str) -> ChangeList:
         return run(
             f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}",
-            sudo=True
+            sudo=True,
         )
 
     def service_start(self, service_name: str, enable: bool = False, sudo: bool = True):
@@ -563,9 +566,9 @@ class Debian(UnixSystem):
 
     def group_member(self, user: str, group: str) -> ChangeList:
         """Ensure a user's membership in a group."""
-        if group in run(f'groups {user}', quiet=True).stdout.split():
+        if group in run(f"groups {user}", quiet=True).stdout.split():
             return []
-        run(f'usermod -aG {group} {user}', sudo=True)
+        run(f"usermod -aG {group} {user}", sudo=True)
         return [cl(UserGroupAdd, user, group)]
 
 
@@ -793,11 +796,11 @@ def run(
 
     if sudo:
         settings.output.alert(f"running sudo: {cmd}")
-        if (cached_sudo_password := settings.get_cached_sudo_password()):
+        if cached_sudo_password := settings.get_cached_sudo_password():
             cmd = f'sudo -S -- bash -c "{cmd}"'
-            if 'stdin' in kwargs:
+            if "stdin" in kwargs:
                 raise ValueError("can't pass stdin when using sudo -S")
-            kwargs['stdin'] = subprocess.PIPE
+            kwargs["stdin"] = subprocess.PIPE
         else:
             ensure_sudo(cmd)
             cmd = f'sudo bash -c "{cmd}"'
@@ -817,7 +820,7 @@ def run(
     with subprocess.Popen(cmd, **kwargs) as s:
         if sudo and cached_sudo_password:
             assert s.stdin
-            s.stdin.write(f'{cached_sudo_password}\n')
+            s.stdin.write(f"{cached_sudo_password}\n")
             s.stdin.close()
         stdout.close()
         stderr.close()
@@ -856,7 +859,7 @@ def run(
 
 def getstdout(*args, **kwargs) -> str:
     """A shorthand for quietly (by default) getting stdout from a shell command."""
-    kwargs.setdefault('quiet', True)
+    kwargs.setdefault("quiet", True)
     return run(*args, **kwargs).stdout.strip()
 
 
@@ -897,7 +900,7 @@ def mkdir(
 ):
     changes = []
     path = _to_path(path)
-    parents_flag = '-p' if parents else ''
+    parents_flag = "-p" if parents else ""
 
     if not path.exists():
         run(f"mkdir {parents_flag} {path}", check=True, sudo=sudo)
@@ -918,7 +921,7 @@ def file_exists_sudo(path: t.Union[str, Path]):
 
 def file(
     path: Pathable,
-    content: t.Union[str, Path],
+    content: t.Union[str, bytes, Path],
     mode: str = None,
     owner: str = None,
     sudo: bool = False,
@@ -928,11 +931,20 @@ def file(
 
     exists = False
 
+    if isinstance(content, bytes):
+        content = content.decode()
+
     if isinstance(content, Path):
         content = content.read_text()
 
-    if not content.endswith("\n"):
-        content += "\n"
+    assert isinstance(content, str)
+
+    newline = "\n"
+    if isinstance(content, bytes):
+        newline = b"\n"
+
+    if not content.endswith(newline):
+        content += newline
 
     def set_perms(p: Pathable) -> ChangeList:
         cs = []
@@ -986,6 +998,7 @@ def file(
         set_perms(tmp)
 
         run(f"mv {tmp} {path}", sudo=True)
+        open(path, "rb").read()
     else:
         run(f"touch {path}")
         set_perms(path)
@@ -1162,6 +1175,9 @@ def this_file_path() -> Path:
 
 
 def template(path: t.Union[str, Path], **kwargs) -> str:
+    """
+    Use Template.safe_substitute to fill out and return a template from the filesystem.
+    """
     p = Path(path)
     if p.is_absolute():
         text = p.read_text()
@@ -1204,26 +1220,32 @@ def _split_cmd_input(cmds: CmdStrs) -> t.List[str]:
 
 
 def _pytest_split_cmds():
-    assert _split_cmd_input(
-        r"""
+    assert (
+        _split_cmd_input(
+            r"""
     ls -lah | \
       grep this \
         that and the other
     echo 'foo'
     """
-    ) == [
-        "ls -lah | grep this that and the other",
-        "echo 'foo'",
-    ]
-    assert _split_cmd_input(
-        """
+        )
+        == [
+            "ls -lah | grep this that and the other",
+            "echo 'foo'",
+        ]
+    )
+    assert (
+        _split_cmd_input(
+            """
     ls -lah | grep this that and the other
     echo 'foo'
     """
-    ) == [
-        "ls -lah | grep this that and the other",
-        "echo 'foo'",
-    ]
+        )
+        == [
+            "ls -lah | grep this that and the other",
+            "echo 'foo'",
+        ]
+    )
 
 
 def download_and_check_sha(url: str, sha256: str) -> Path:
@@ -1240,7 +1262,7 @@ def download_and_check_sha(url: str, sha256: str) -> Path:
             try:
                 urllib.request.urlretrieve(url, filename=output_path)
             except urllib.error.URLError as e:
-                if tries <= 0 or 'Device or resource busy' not in str(e):
+                if tries <= 0 or "Device or resource busy" not in str(e):
                     raise
                 logger.exception(f'Hit "device busy" when retrieving {url}')
                 tries -= 1
@@ -1248,7 +1270,6 @@ def download_and_check_sha(url: str, sha256: str) -> Path:
                 sleep_secs *= 2
             else:
                 break
-
 
     sha = hashlib.sha256()
 
@@ -1279,7 +1300,7 @@ class PathHelper:
     sudo: t.Optional[bool] = None
     changes: t.List[ChangeList] = field(default_factory=list)
 
-    def rm(self, flags: str = "", **kwargs) -> 'PathHelper':
+    def rm(self, flags: str = "", **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
 
         if self.path.exists():
@@ -1287,34 +1308,141 @@ class PathHelper:
             self.changes.append([FileRm(str(self.path))])
         return self
 
-    def contents(self, *args, **kwargs) -> 'PathHelper':
+    def contents(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
-        self.changes.append(file_(self.path, *args, **kwargs))
+        self.changes.extend(file_(self.path, *args, **kwargs))
         return self
 
-    content = contents
+    def content(self, *args, **kwargs) -> "PathHelper":
+        return self.contents(*args, **kwargs)
 
-    def chmod(self, *args, **kwargs) -> 'PathHelper':
+    def chmod(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
-        self.changes.append(chmod(self.path, *args, **kwargs))
+        self.changes.extend(chmod(self.path, *args, **kwargs))
         return self
 
-    def chown(self, *args, **kwargs) -> 'PathHelper':
+    def chown(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
-        self.changes.append(chown(self.path, *args, **kwargs))
+        self.changes.extend(chown(self.path, *args, **kwargs))
         return self
 
-    def mkdir(self, *args, **kwargs) -> 'PathHelper':
+    def mkdir(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
-        self.changes.append(mkdir(self.path, *args, **kwargs))
+        self.changes.extend(mkdir(self.path, *args, **kwargs))
         return self
 
     def _fill_default_kwargs(self, kwargs: dict) -> dict:
-        if self.sudo is not None and 'sudo' not in kwargs:
-            kwargs['sudo'] = self.sudo
+        if self.sudo is not None and "sudo" not in kwargs:
+            kwargs["sudo"] = self.sudo
         return kwargs
-
 
 
 def p(pathlike: t.Union[Path, str], *args, **kwargs) -> PathHelper:
     return PathHelper(Path(pathlike), *args, **kwargs)
+
+
+class Systemd:
+    """
+    Various utilities for working with systemd.
+    """
+
+    def user_service(
+        self,
+        service_name: str,
+        description: str,
+        exec_start_contents: str,
+        user: t.Optional[str] = None,
+        working_directory: t.Optional[str] = None,
+        sudo: bool = True,
+    ) -> ChangeList:
+        """
+        Install a very basic service unit at the user level.
+        """
+        changes: ChangeList = []
+        is_root = getpass.getuser() == 'root'
+        user = user or getpass.getuser()
+
+        working_directory_line = ''
+        if working_directory:
+            working_directory_line = f"WorkingDirectory = {working_directory}"
+
+
+        contents = dedent(
+            f"""
+            [Unit]
+            Description={description}
+
+            [Service]
+            Type=simple
+            StandardOutput=journal
+            ExecStart={exec_start_contents}
+            {working_directory_line}
+
+            [Install]
+            WantedBy=default.target
+        """
+        )
+
+        user_dir = Path(f"/home/{user}/.config/systemd/user")
+        changes.extend(p(user_dir, sudo=sudo).mkdir().chown(f'{user}:{user}').changes)
+
+        service_change = (
+            p(user_dir / f"{service_name}.service", sudo=sudo)
+            .contents(contents)
+            .chown(f'{user}:{user}')
+            .chmod("600")
+            .changes
+        )
+        changes.extend(service_change)
+
+        self.run_as_user(user, f"systemctl --user enable {service_name}.service").assert_ok()
+
+        is_running = self.is_service_running(service_name, as_user=user)
+        action = 'start'
+        if service_change:
+            action = 'restart'
+
+        if service_change or not is_running:
+            self.run_as_user(user, f"systemctl --user {action} {service_name}.service")
+
+        return changes
+
+    def is_service_running(self, service_name: str, as_user: t.Optional[str] = None) -> bool:
+        return self.service_status(service_name, as_user) == 'active'
+
+    def service_status(self, service_name: str, as_user: t.Optional[str] = None) -> str:
+        user_flag = ''
+        as_user = as_user or getpass.getuser()
+        is_root = as_user == 'root'
+        if not is_root:
+            user_flag = '--user'
+
+        cmd = f"systemctl show {user_flag} {service_name} --no-page"
+        info = self.run_as_user(as_user, cmd, quiet=True).assert_ok().stdout
+
+        infod = dict([i.split('=', 1) for i in info.splitlines()])
+
+        if not 'ActiveState' in infod:
+            print(infod)
+        return infod['ActiveState']
+
+    def restart_service(self, name: str, as_user: t.Optional[str]) -> RunReturn:
+        as_user = as_user or getpass.getuser()
+        is_root = as_user == 'root'
+        user_flag = ''
+        if not is_root:
+            user_flag = '--user'
+        self.run_as_user(as_user, f'systemctl {user_flag} restart {name}')
+
+    def run_as_user(self, user: str, cmd: str, *args, **kwargs) -> RunReturn:
+        uid = pwd.getpwnam(user).pw_uid
+
+        # Per https://unix.stackexchange.com/q/245768
+        env = (
+            f'XDG_RUNTIME_DIR="/run/user/{uid}" '
+            f'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/{uid}/bus"')
+
+        return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
+
+
+systemd = Systemd()

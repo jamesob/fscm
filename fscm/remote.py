@@ -1,11 +1,12 @@
 import logging
 import inspect
+import typing as t
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-import typing as t
+from string import Template
 
 import mitogen.master
 import mitogen.core
@@ -34,6 +35,9 @@ class SSH(MitogenConnection):
     pass
 
 class Su(MitogenConnection):
+    pass
+
+class Sudo(MitogenConnection):
     pass
 
 class Local(MitogenConnection):
@@ -358,10 +362,15 @@ def get_context_from_spec(
             route_fnc = router.ssh
         elif isinstance(spec, Su):
             route_fnc = router.su
+        elif isinstance(spec, Sudo):
+            route_fnc = router.sudo
         elif isinstance(spec, Local):
             route_fnc = router.local
         else:
-            raise ValueError("unknown spec type")
+            try:
+                route_fnc = getattr(router, spec.__class__.__name__.lower())
+            except AttributeError:
+                raise ValueError("unknown spec type")
 
         kwargs.update(**spec.__dict__)
 
@@ -407,6 +416,10 @@ class Parent:
     def get_file(self, path: str) -> bytes:
         self.to_parent.send(GetFileMsg(path))
         return self.from_parent.get().unpickle()
+
+    def template(self, path: str, **kwargs) -> str:
+        f = self.get_file(path)
+        return Template(f.decode()).safe_substitute(**kwargs)
 
     def get_secret(self, name: str) -> str:
         self.to_parent.send(GetSecretMsg(name))
