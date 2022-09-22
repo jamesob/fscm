@@ -1,3 +1,4 @@
+# TODO: filesystem mutex to avoid simultaneous runs
 import logging
 import inspect
 import typing as t
@@ -15,7 +16,7 @@ import mitogen.select
 import mitogen.parent
 
 
-log = logging.getLogger('fscm.remote')
+log = logging.getLogger("fscm.remote")
 
 
 class MitogenConnection(SimpleNamespace):
@@ -24,21 +25,23 @@ class MitogenConnection(SimpleNamespace):
 
     def __repr__(self):
         def hide(k, v):
-            return '[hidden]' if k in {'password'} else v
+            return "[hidden]" if k in {"password"} else v
 
-        attrs = ", ".join(
-            "%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items()
-        )
+        attrs = ", ".join("%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items())
         return f"{self.__class__.__name__}({attrs})"
+
 
 class SSH(MitogenConnection):
     pass
 
+
 class Su(MitogenConnection):
     pass
 
+
 class Sudo(MitogenConnection):
     pass
+
 
 class Local(MitogenConnection):
     pass
@@ -46,23 +49,42 @@ class Local(MitogenConnection):
 
 ConnSpec = t.Iterable[MitogenConnection]
 
-@dataclass
+
 class Host:
     """An individual host that will be provisioned to."""
-    hostname: str
-    username: t.Optional[str] = None
 
-    # Secrets accessible to this host
-    secrets: SimpleNamespace = field(default_factory=SimpleNamespace)
-
-    # A description of how fscm will connect to this host.
-    connection_spec: t.Optional[ConnSpec] = None
+    def __init__(
+        self,
+        name: str,
+        username: t.Optional[str] = None,
+        secrets: t.Optional[SimpleNamespace] = None,
+        connection_spec: t.Optional[ConnSpec] = None,
+        allowed_file_globs: t.Optional[t.List[str]] = None,
+    ):
+        """
+        Args:
+            secrets: secrets that are attached to the host.
+            connection_spec: how to connect to this particular host.
+            allowed_file_globs: files on the parent host that this host
+              can access.
+        """
+        self.name = name
+        self.username = username
+        self.secrets = secrets or SimpleNamespace()
+        self.connection_spec = connection_spec
+        self.allowed_file_globs = allowed_file_globs or []
 
     def __hash__(self):
-        return hash(self.hostname)
+        return hash(self.name)
 
     def __repr__(self):
-        return f"Host(hostname={self.hostname!r}, connection_spec={self.connection_spec!r})"
+        return f"Host(name={self.name!r}, connection_spec={self.connection_spec!r})"
+
+    def allow_file_access(self, *globs: str):
+        """
+        Allow child hosts to access any path matching `glob` on the host system.
+        """
+        self.allowed_file_globs.extend(globs)
 
 
 # `fscm.settings.sudo_password` value that is set here during remote child boot
@@ -107,10 +129,17 @@ class HostGroupCallResult:
     def ok(self):
         return (not bool(self.failed)) and len(self.succeeded) == len(self.hosts)
 
+    @property
+    def all_results(self):
+        d = dict(self.succeeded)
+        d.update(self.failed)
+        return d
+
 
 @dataclass
 class RemoteMsg:
     """A message transmitted between parent and child."""
+
     pass
 
 
@@ -131,9 +160,9 @@ class BadChildRequest:
 
 @dataclass
 class RemoteExecutor:
-    """A group of hosts that can be deployed to."""
-    hosts: t.List[Host]
+    """A mechanism to execute arbitrary functions on a group of hosts."""
 
+    hosts: t.List[Host]
     router: mitogen.master.Router
 
     # A cache of the mitogen contexts, e.g. an active SSH connection, per host.
@@ -142,7 +171,7 @@ class RemoteExecutor:
     _allowed_file_globs: t.List[str] = field(default_factory=list)
 
     def __post_init__(self):
-        names = Counter(h.hostname for h in self.hosts)
+        names = Counter(h.name for h in self.hosts)
         dups = {k for k, count in names.items() if count > 1}
 
         if dups:
@@ -160,6 +189,18 @@ class RemoteExecutor:
         Returns the results of the function call, keyed by each host.
         """
         return self._call_for_each_host(fnc, *args, **kwargs)
+
+    def run_on_hosts(self, host_prefix, fnc, *args, **kwargs) -> HostGroupCallResult:
+        """
+        Run a function remotely on each matching host, blocking until all hosts complete
+        the task.
+
+        Returns the results of the function call, keyed by each host.
+
+        TODO: make filtering here better
+        """
+        hosts = [h for h in self.hosts if h.name.startswith(host_prefix)]
+        return self._call_for_each_host(fnc, *args, hosts=hosts, **kwargs)
 
     def allow_file_access(self, *globs: str):
         """
@@ -193,19 +234,24 @@ class RemoteExecutor:
 
             for spec in connspec:
                 if isinstance(spec, SSH):
-                    spec.hostname = host.hostname
+                    spec.hostname = host.name
                     if OPTIONS.check_host_keys is not None:
                         spec.check_host_keys = OPTIONS.check_host_keys
 
-            log.info("connecting to host %s; may prompt for credentials", host.hostname)
+            log.info("connecting to host %s; may prompt for credentials", host.name)
+            # TODO probably try and do this in parallel?
             try:
                 self._host_to_context[host] = get_context_from_spec(
-                    self.router, connspec)
+                    self.router, connspec
+                )
             except Exception:
                 log.exception(f"failed to connect to %s", host)
                 raise
 
-    def _call_for_each_host(self, fnc, *args, **kwargs) -> HostGroupCallResult:
+    def _call_for_each_host(
+        self, fnc, *args, hosts: t.Optional[t.Sequence[Host]] = None, **kwargs
+    ) -> HostGroupCallResult:
+        hosts = hosts if hosts is not None else self.hosts
         result = HostGroupCallResult(self.hosts)
         task_to_host = {}
         host_to_task = {}
@@ -218,14 +264,15 @@ class RemoteExecutor:
         self._connect_hosts()
 
         # Boot each host and get it started executing the task
-        for h in self.hosts:
+        for h in hosts:
             assert h in self._host_to_context
             from_child = mitogen.core.Receiver(self.router)
             from_children[h] = from_child
             receiver_to_child_host[from_child] = h
 
             task = self._host_to_context[h].call_async(
-                boot_child_and_call, h, from_child.to_sender(), fnc, *args, **kwargs)
+                boot_child_and_call, h, from_child.to_sender(), fnc, *args, **kwargs
+            )
             select_msg_from_child.add(from_child)
             task_to_host[task] = h
             host_to_task[h] = task
@@ -258,11 +305,13 @@ class RemoteExecutor:
                 child_host = receiver_to_child_host[child_recv]
                 msg = msg_from_child.data.unpickle()
 
-                if (bad_request := self._handle_msg_from_child(
-                        child_host, to_children[child_recv], msg)):
+                if bad_request := self._handle_msg_from_child(
+                    child_host, to_children[child_recv], msg
+                ):
                     log.warning(
                         "child host made a bad request: %s; terminating task",
-                        bad_request)
+                        bad_request,
+                    )
                     failed_task = host_to_task[child_host]
                     # Child has violated our expecetations with an unreasonable request;
                     # fail the task as a whole.
@@ -285,13 +334,13 @@ class RemoteExecutor:
                 try:
                     task_result = host_complete.data.unpickle()
                 except mitogen.core.CallError as e:
-                    log.warning("task failed on host %r: %s", host.hostname, e)
+                    log.warning("task failed on host %r: %s", host.name, e)
                     result.failed[host] = e
                 else:
-                    log.info("task succeeded on host %r", host.hostname)
+                    log.debug("task succeeded on host %r", host.name)
                     result.succeeded[host] = task_result
 
-                log.info(f"completed task for host: {host.hostname}")
+                log.debug(f"completed task for host: {host.name}")
                 select_host_task.remove(host_complete.source)
 
         return result
@@ -304,14 +353,18 @@ class RemoteExecutor:
         """
         if isinstance(msg, GetFileMsg):
             path = Path(msg.path)
-            if any(path.match(glob) for glob in self._allowed_file_globs):
+            allowed_globs = self._allowed_file_globs + child_host.allowed_file_globs
+            if any(path.match(glob) for glob in allowed_globs):
                 to_child.send(path.read_bytes())
             else:
-                return BadChildRequest(f"unauthorized request for file: {path}")
+                return BadChildRequest(
+                    f"unauthorized request for file: {path}; "
+                    f"allowed paths are {allowed_globs}"
+                )
         elif isinstance(msg, GetSecretMsg):
             secret_path = msg.name
             if isinstance(secret_path, str):
-                secret_path = secret_path.split('.')
+                secret_path = secret_path.split(".")
 
             sek = child_host.secrets
             for component in secret_path:
@@ -319,21 +372,23 @@ class RemoteExecutor:
                     sek = getattr(sek, component)
                 except AttributeError:
                     return BadChildRequest(
-                        f"bad secret path for host {child_host}: {secret_path}")
+                        f"bad secret path for host {child_host}: {secret_path}"
+                    )
 
             assert isinstance(sek, str)
             to_child.send(sek)
         else:
-            raise ValueError('unrecognized msg')
+            raise ValueError("unrecognized msg")
 
 
 @contextmanager
 def mitogen_router():
-    mitogen.core.set_pickle_whitelist([
-        r'fscm\..+', r'__main__\..+', *OPTIONS.pickle_whitelist])
+    mitogen.core.set_pickle_whitelist(
+        [r"fscm\..+", r"__main__\..+", *OPTIONS.pickle_whitelist]
+    )
     broker = mitogen.master.Broker()
     router = mitogen.master.Router(broker)
-    mitogen.utils.log_to_file(level='INFO')
+    mitogen.utils.log_to_file(level="INFO")
     try:
         yield router
     finally:
@@ -355,7 +410,7 @@ def get_context_from_spec(
 
     for spec in specs:
         kwargs = {
-            'python_path': ['/usr/bin/env', 'python3'],
+            "python_path": ["/usr/bin/env", "python3"],
         }
 
         if isinstance(spec, SSH):
@@ -375,7 +430,7 @@ def get_context_from_spec(
         kwargs.update(**spec.__dict__)
 
         if curr_context:
-            kwargs['via'] = curr_context
+            kwargs["via"] = curr_context
 
         curr_context = route_fnc(**kwargs)
 
@@ -400,16 +455,17 @@ def get_mitogen_context(router, hostname, *args, log_level="INFO", **kwargs):
     # router.enable_debug()
     return context
 
+
 @dataclass
 class Parent:
     to_parent: mitogen.core.Sender
     from_parent: mitogen.core.Receiver
 
     @classmethod
-    def from_sender(cls, to_parent) -> 'Parent':
+    def from_sender(cls, to_parent) -> "Parent":
         from_parent = mitogen.core.Receiver(to_parent.context.router)
         to_parent.send(from_parent.to_sender())
-        log.info("sent Sender from child to parent")
+        log.debug("sent Sender from child to parent")
 
         return cls(to_parent, from_parent)
 
@@ -417,29 +473,36 @@ class Parent:
         self.to_parent.send(GetFileMsg(path))
         return self.from_parent.get().unpickle()
 
-    def template(self, path: str, **kwargs) -> str:
+    def template(self, path: str, safe_substitute: bool = False, **kwargs) -> str:
         f = self.get_file(path)
-        return Template(f.decode()).safe_substitute(**kwargs)
+        t = Template(f.decode())
+        if safe_substitute:
+            return t.safe_substitute(**kwargs)
+        else:
+            return t.substitute(**kwargs)
 
     def get_secret(self, name: str) -> str:
         self.to_parent.send(GetSecretMsg(name))
         return self.from_parent.get().unpickle()
 
 
-def boot_child_and_call(host: Host, to_parent: mitogen.core.Sender, fnc, *args, **kwargs):
+def boot_child_and_call(
+    host: Host, to_parent: mitogen.core.Sender, fnc, *args, **kwargs
+):
     argspec = inspect.getfullargspec(fnc)
     parent = Parent.from_sender(to_parent)
+    args = list(args)
 
-    if (sudo_password := getattr(host.secrets, 'sudo_password', None)):
+    if sudo_password := getattr(host.secrets, "sudo_password", None):
         # This value will be detected and made use of in
         # `fscm.Settings.get_cached_sudo_password()`.
         global CACHED_SUDO_PASSWORD
         CACHED_SUDO_PASSWORD = sudo_password
 
-    if 'parent' in argspec.args:
-        kwargs['parent'] = parent
+    if "host" in argspec.args:
+        args.insert(argspec.args.index("host"), host)
 
-    if 'host' in argspec.args:
-        kwargs['host'] = host
+    if "parent" in argspec.args:
+        args.insert(argspec.args.index("parent"), parent)
 
     return fnc(*args, **kwargs)

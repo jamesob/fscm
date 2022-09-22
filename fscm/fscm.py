@@ -1353,7 +1353,7 @@ class Systemd:
         exec_start_contents: str,
         user: t.Optional[str] = None,
         working_directory: t.Optional[str] = None,
-        sudo: bool = True,
+        sudo: bool = False,
     ) -> ChangeList:
         """
         Install a very basic service unit at the user level.
@@ -1407,42 +1407,54 @@ class Systemd:
 
         return changes
 
+    def _user_flag(self, as_user: t.Optional[str] = None):
+        as_user = as_user or getpass.getuser()
+        is_root = as_user == 'root'
+        return '--user' if not is_root else '--user'
+
     def is_service_running(self, service_name: str, as_user: t.Optional[str] = None) -> bool:
         return self.service_status(service_name, as_user) == 'active'
 
-    def service_status(self, service_name: str, as_user: t.Optional[str] = None) -> str:
-        user_flag = ''
-        as_user = as_user or getpass.getuser()
-        is_root = as_user == 'root'
-        if not is_root:
-            user_flag = '--user'
+    def enable_service(self, service_name: str, start: bool = True, sudo: bool = False) -> ChangeList:
+        uflag = self._user_flag() if not sudo else ''
 
-        cmd = f"systemctl show {user_flag} {service_name} --no-page"
+        status = run(f'systemctl {uflag} is-enabled {service_name}', quiet=True)
+        if 'disabled' in status.stdout or not status.ok:
+            run(f'systemctl {uflag} enable {service_name}').assert_ok()
+
+        if start and not self.is_service_running(service_name):
+            run(f'systemctl {uflag} start {service_name}').assert_ok()
+
+        # TODO fill this changelist out
+        return []
+
+    def service_status(self, service_name: str, as_user: t.Optional[str] = None) -> str:
+        cmd = f"systemctl show {self._user_flag(as_user)} {service_name} --no-page"
         info = self.run_as_user(as_user, cmd, quiet=True).assert_ok().stdout
 
         infod = dict([i.split('=', 1) for i in info.splitlines()])
 
-        if not 'ActiveState' in infod:
+        if 'ActiveState' not in infod:
             print(infod)
         return infod['ActiveState']
 
-    def restart_service(self, name: str, as_user: t.Optional[str]) -> RunReturn:
-        as_user = as_user or getpass.getuser()
-        is_root = as_user == 'root'
-        user_flag = ''
-        if not is_root:
-            user_flag = '--user'
-        self.run_as_user(as_user, f'systemctl {user_flag} restart {name}')
+    def restart_service(self, name: str, as_user: t.Optional[str] = None) -> RunReturn:
+        self.run_as_user(as_user, f'systemctl {self._user_flag(as_user)} restart {name}')
 
     def run_as_user(self, user: str, cmd: str, *args, **kwargs) -> RunReturn:
+        user = user or getpass.getuser()
         uid = pwd.getpwnam(user).pw_uid
+        needs_sudo = getpass.getuser() != user
 
         # Per https://unix.stackexchange.com/q/245768
         env = (
             f'XDG_RUNTIME_DIR="/run/user/{uid}" '
             f'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/{uid}/bus"')
 
-        return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
+        if needs_sudo:
+            return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
+        else:
+            return run(f"{env} {cmd}", *args, **kwargs)
 
 
 systemd = Systemd()
