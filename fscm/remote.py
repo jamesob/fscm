@@ -1,6 +1,7 @@
 # TODO: filesystem mutex to avoid simultaneous runs
 import logging
 import inspect
+import os
 import typing as t
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -19,6 +20,8 @@ import mitogen.parent
 log = logging.getLogger("fscm.remote")
 
 
+# TODO: just duplicate the interface of the Router functions listed
+# in https://mitogen.networkgenomics.com/api.html.
 class MitogenConnection(SimpleNamespace):
     def __hash__(self):
         return hash(str(self.__dict__))
@@ -56,10 +59,14 @@ class Host:
     def __init__(
         self,
         name: str,
+        tags: t.Optional[list] = None,
         username: t.Optional[str] = None,
         secrets: t.Optional[SimpleNamespace] = None,
         connection_spec: t.Optional[ConnSpec] = None,
         allowed_file_globs: t.Optional[t.List[str]] = None,
+        ssh_hostname: t.Optional[str] = None,
+        ssh_port: t.Optional[int] = None,
+        ssh_username: t.Optional[str] = None,
     ):
         """
         Args:
@@ -69,10 +76,23 @@ class Host:
               can access.
         """
         self.name = name
+        self.tags = tags or []
         self.username = username
         self.secrets = secrets or SimpleNamespace()
         self.connection_spec = connection_spec
         self.allowed_file_globs = allowed_file_globs or []
+
+        self.ssh_hostname = ssh_hostname
+        self.ssh_username = ssh_username
+        self.ssh_port = ssh_port
+
+        if (ssh_hostname or ssh_port) and not connection_spec:
+            self.connection_spec = [
+                SSH(
+                    hostname=(ssh_hostname or name),
+                    port=(ssh_port or 22),
+                    username=(ssh_username or username)),
+            ]
 
     def __hash__(self):
         return hash(self.name)
@@ -190,7 +210,7 @@ class RemoteExecutor:
         """
         return self._call_for_each_host(fnc, *args, **kwargs)
 
-    def run_on_hosts(self, host_prefix, fnc, *args, **kwargs) -> HostGroupCallResult:
+    def run_on_hosts(self, filterfnc, fnc, *args, **kwargs) -> HostGroupCallResult:
         """
         Run a function remotely on each matching host, blocking until all hosts complete
         the task.
@@ -199,7 +219,7 @@ class RemoteExecutor:
 
         TODO: make filtering here better
         """
-        hosts = [h for h in self.hosts if h.name.startswith(host_prefix)]
+        hosts = [h for h in self.hosts if filterfnc(h)]
         return self._call_for_each_host(fnc, *args, hosts=hosts, **kwargs)
 
     def allow_file_access(self, *globs: str):
@@ -234,7 +254,10 @@ class RemoteExecutor:
 
             for spec in connspec:
                 if isinstance(spec, SSH):
-                    spec.hostname = host.name
+                    if not getattr(spec, 'hostname', None):
+                        spec.hostname = host.name
+                    if not getattr(spec, 'username', None):
+                        spec.username = host.username
                     if OPTIONS.check_host_keys is not None:
                         spec.check_host_keys = OPTIONS.check_host_keys
 
@@ -388,7 +411,8 @@ def mitogen_router():
     )
     broker = mitogen.master.Broker()
     router = mitogen.master.Router(broker)
-    mitogen.utils.log_to_file(level="INFO")
+    log_level = os.environ.get('MITOGEN_LOG_LEVEL', 'INFO')
+    mitogen.utils.log_to_file(level=log_level)
     try:
         yield router
     finally:
@@ -444,9 +468,8 @@ def mitogen_context(*args, **kwargs):
         yield (router, get_mitogen_context(router, *args, **kwargs))
 
 
-def get_mitogen_context(router, hostname, *args, log_level="INFO", **kwargs):
+def get_mitogen_context(router, hostname, *args, **kwargs):
     kwargs.setdefault("python_path", ["/usr/bin/env", "python3"])
-    mitogen.utils.log_to_file(level=log_level)
     context = (
         router.local(*args, **kwargs)
         if hostname == "localhost"
