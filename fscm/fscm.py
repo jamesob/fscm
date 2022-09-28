@@ -401,7 +401,7 @@ class UnixSystem:
                     f"rm {dest} && ln {flags} {target} {dest}",
                     sudo=needs_sudo_for_write,
                 )
-                return [cl(SymlinkModify, str(target), str(dest))]
+                return [cl(SymlinkModify, str(target), str(current_target), str(dest))]
 
         return []
 
@@ -908,9 +908,9 @@ def mkdir(
         raise DirectoryExistsError(path)
 
     if mode:
-        changes.extend(chmod(path, mode))
+        changes.extend(chmod(path, mode, sudo=sudo))
     if owner:
-        changes.extend(chown(path, owner))
+        changes.extend(chown(path, owner, sudo=sudo))
 
     return changes
 
@@ -958,7 +958,7 @@ def file(
         if sudo:
             exists = file_exists_sudo(path)
         else:
-            raise FscmException("can't detect file {path} without sudo")
+            raise FscmException(f"can't detect file {path} without sudo")
     else:
         exists = path.exists()
 
@@ -998,7 +998,6 @@ def file(
         set_perms(tmp)
 
         run(f"mv {tmp} {path}", sudo=True)
-        open(path, "rb").read()
     else:
         run(f"touch {path}")
         set_perms(path)
@@ -1310,7 +1309,7 @@ class PathHelper:
 
     def contents(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
-        self.changes.extend(file_(self.path, *args, **kwargs))
+        self.changes.extend(file(self.path, *args, **kwargs))
         return self
 
     def content(self, *args, **kwargs) -> "PathHelper":
@@ -1339,6 +1338,36 @@ class PathHelper:
 
 def p(pathlike: t.Union[Path, str], *args, **kwargs) -> PathHelper:
     return PathHelper(Path(pathlike), *args, **kwargs)
+
+
+@dataclass
+class ServiceAdded(Change):
+    service_name: str
+    msg: str = "add service {service_name}"
+
+
+@dataclass
+class ServiceEnabled(Change):
+    service_name: str
+    msg: str = "enabled service {service_name}"
+
+
+@dataclass
+class ServiceStarted(Change):
+    service_name: str
+    msg: str = "started service {service_name}"
+
+
+@dataclass
+class ServiceRestarted(Change):
+    service_name: str
+    msg: str = "restarted service {service_name}"
+
+
+@dataclass
+class ServiceStopped(Change):
+    service_name: str
+    msg: str = "restarted service {service_name}"
 
 
 class Systemd:
@@ -1412,24 +1441,28 @@ class Systemd:
         is_root = as_user == 'root'
         return '--user' if not is_root else '--user'
 
-    def is_service_running(self, service_name: str, as_user: t.Optional[str] = None) -> bool:
-        return self.service_status(service_name, as_user) == 'active'
+    def is_service_running(self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> bool:
+        return self.service_status(service_name, as_user, sudo=sudo) == 'active'
 
-    def enable_service(self, service_name: str, start: bool = True, sudo: bool = False) -> ChangeList:
+    def enable_service(self, service_name: str, start: bool = True, restart: bool = False, sudo: bool = False) -> ChangeList:
         uflag = self._user_flag() if not sudo else ''
 
         status = run(f'systemctl {uflag} is-enabled {service_name}', quiet=True)
         if 'disabled' in status.stdout or not status.ok:
-            run(f'systemctl {uflag} enable {service_name}').assert_ok()
+            run(f'systemctl {uflag} enable {service_name}', sudo=sudo).assert_ok()
 
-        if start and not self.is_service_running(service_name):
-            run(f'systemctl {uflag} start {service_name}').assert_ok()
+        is_running = self.is_service_running(service_name, sudo=sudo)
+        if start and not is_running:
+            run(f'systemctl {uflag} start {service_name}', sudo=sudo).assert_ok()
+        elif is_running and restart:
+            run(f'systemctl {uflag} restart {service_name}', sudo=sudo).assert_ok()
 
         # TODO fill this changelist out
         return []
 
-    def service_status(self, service_name: str, as_user: t.Optional[str] = None) -> str:
-        cmd = f"systemctl show {self._user_flag(as_user)} {service_name} --no-page"
+    def service_status(self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> str:
+        uf = self._user_flag(as_user) if not sudo else ''
+        cmd = f"systemctl show {uf} {service_name} --no-page"
         info = self.run_as_user(as_user, cmd, quiet=True).assert_ok().stdout
 
         infod = dict([i.split('=', 1) for i in info.splitlines()])
@@ -1438,8 +1471,9 @@ class Systemd:
             print(infod)
         return infod['ActiveState']
 
-    def restart_service(self, name: str, as_user: t.Optional[str] = None) -> RunReturn:
-        self.run_as_user(as_user, f'systemctl {self._user_flag(as_user)} restart {name}')
+    def restart_service(self, name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> RunReturn:
+        uf = self._user_flag(as_user) if not sudo else ''
+        self.run_as_user(as_user, f'systemctl {uf} restart {name}')
 
     def run_as_user(self, user: str, cmd: str, *args, **kwargs) -> RunReturn:
         user = user or getpass.getuser()
