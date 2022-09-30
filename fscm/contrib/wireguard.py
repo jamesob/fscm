@@ -1,18 +1,18 @@
-import re
 import typing as t
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent
 from ipaddress import IPv4Address
 
-import yaml
 import fscm
-from fscm import p, run, file_, ChangeList, s, remote
-import textwrap
+from fscm import p, run, remote
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class WireguardPeer:
+class Peer:
     name: str
     ip: IPv4Address
     pubkey: str
@@ -22,14 +22,14 @@ class WireguardPeer:
 
 
 @dataclass
-class WireguardServer:
+class Server:
     name: str
     cidr: str
     port: int
     pubkey: str
     interfaces: t.List[str]
     host: str
-    external_peers: t.Map[str, str]
+    external_peers: t.Dict[str, str]
 
     @classmethod
     def from_dict(cls, name, d):
@@ -40,11 +40,42 @@ class WireguardServer:
             pubkey=d["pubkey"],
             interfaces=d["interfaces"],
             host=d["host"],
-            external_peers=d.get('external_peers', {}),
+            external_peers=d.get("external_peers", {}),
         )
 
 
-def wg_server_config(wg: WireguardServer, hosts: [Host]) -> str:
+class WireguardHostType(t.Protocol):
+    wireguards: t.Dict[str, Peer]
+    name: str
+
+
+class Host(remote.Host):
+    """A mixin that adds the .wireguard attribute to a Host."""
+
+    def __init__(
+        self,
+        *args,
+        wgs: t.Optional[t.Dict[str, Peer]] = None,
+        **kwargs,
+    ):
+        kwargs.setdefault("ssh_hostname", args[0] + ".lan")
+        super().__init__(*args, **kwargs)
+        self.wireguards = wgs or {}
+
+    @classmethod
+    def from_dict(cls, name, d):
+        wgd = d.pop("wireguard", {})
+        instance = super().from_dict(name, d)
+        wgs = {}
+
+        for wgname, netd in wgd.items():
+            wgs[wgname] = Peer(wgname, **netd)
+
+        instance.wireguards = wgs
+        return instance
+
+
+def wg_server_config(wg: Server, hosts: t.List[WireguardHostType]) -> str:
     hosts = [h for h in hosts if wg.name in h.wireguards]
 
     conf = dedent(
@@ -88,9 +119,9 @@ def wg_server_config(wg: WireguardServer, hosts: [Host]) -> str:
         )
 
     for name, val in wg.external_peers.items():
-        [pubkey, ip] = [i.strip() for i in val.split(',')]
-        if ip.endswith('/32'):
-            ip = ip.rstrip('/32')
+        [pubkey, ip] = [i.strip() for i in val.split(",")]
+        if ip.endswith("/32"):
+            ip = ip.rstrip("/32")
 
         conf += dedent(
             f"""
@@ -105,11 +136,13 @@ def wg_server_config(wg: WireguardServer, hosts: [Host]) -> str:
     return conf
 
 
-def wireguard_server(host: Host, wg: WireguardServer, hosts: [Host]):
+def server(
+    host: remote.Host, wg: Server, hosts: t.List[WireguardHostType]
+):
     fscm.s.pkgs_install("wireguard-tools")
 
     if not wg.pubkey:
-        pubkey = make_wireguard_privkey(wg.name)
+        pubkey = make_privkey(wg.name)
         print(f"Pubkey for {host}, {wg} is {pubkey}")
 
     changed = (
@@ -121,20 +154,39 @@ def wireguard_server(host: Host, wg: WireguardServer, hosts: [Host]):
     fscm.systemd.enable_service(f"wg-quick@{wg.name}", restart=bool(changed), sudo=True)
 
 
-def wireguard_peer(host: Host, wgs: dict[str, WireguardServer]):
-    for wgname, wg in host.wireguards.items():
+def peer(host: WireguardHostType, wgs: dict[str, Server]):
+    fscm.s.pkgs_install("wireguard-tools")
+
+    for wg in host.wireguards.values():
+        if not wg.pubkey:
+            pubkey = make_privkey(wg.name)
+            if not pubkey:
+                logger.warn(f"privkey for {host}, {wg} already exists - using that")
+                pubkey = (
+                    run(
+                        f"cat /etc/wireguard/{wg.name}-privkey | wg pubkey",
+                        sudo=True,
+                        quiet=True,
+                    )
+                    .assert_ok()
+                    .stdout
+                )
+
+            logger.info(f"setting pubkey for {wg}: {pubkey}")
+            wg.pubkey = pubkey
+
         server = wgs[wg.name]
         changed = bool(
             p(f"/etc/wireguard/{wg.name}.conf", sudo=True)
-            .contents(wireguard_peer_config(host, server, wg))
+            .contents(peer_config(server, wg))
             .changes
         )
 
         fscm.systemd.enable_service(f"wg-quick@{wg.name}", restart=changed, sudo=True)
 
 
-def wireguard_peer_config(host: Host, wgs: WireguardServer, wg: WireguardPeer):
-    first_host = wgs.cidr.split('/')[0]
+def peer_config(wgs: Server, wg: Peer) -> str:
+    first_host = wgs.cidr.split("/")[0]
     return dedent(
         f"""
         [Interface]
@@ -152,7 +204,7 @@ def wireguard_peer_config(host: Host, wgs: WireguardServer, wg: WireguardPeer):
     ).lstrip()
 
 
-def make_wireguard_privkey(wg_name: str, overwrite: bool = False) -> t.Optional[str]:
+def make_privkey(wg_name: str, overwrite: bool = False) -> t.Optional[str]:
     privkey = Path(f"/etc/wireguard/{wg_name}-privkey")
     if not overwrite:
         if run(f"ls {privkey}", sudo=True, quiet=True).ok:
@@ -167,5 +219,3 @@ def make_wireguard_privkey(wg_name: str, overwrite: bool = False) -> t.Optional[
         .assert_ok()
         .stdout.strip()
     )
-
-

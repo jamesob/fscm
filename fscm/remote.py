@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from string import Template
 
+from .secrets import Secrets
+
 import mitogen.master
 import mitogen.core
 import mitogen.utils
@@ -61,12 +63,13 @@ class Host:
         name: str,
         tags: t.Optional[list] = None,
         username: t.Optional[str] = None,
-        secrets: t.Optional[SimpleNamespace] = None,
+        secrets: t.Optional[Secrets] = None,
         connection_spec: t.Optional[ConnSpec] = None,
         allowed_file_globs: t.Optional[t.List[str]] = None,
         ssh_hostname: t.Optional[str] = None,
         ssh_port: t.Optional[int] = None,
         ssh_username: t.Optional[str] = None,
+        check_host_keys: str = 'enforce',
     ):
         """
         Args:
@@ -78,20 +81,23 @@ class Host:
         self.name = name
         self.tags = tags or []
         self.username = username
-        self.secrets = secrets or SimpleNamespace()
+        self.secrets = secrets or Secrets()
         self.connection_spec = connection_spec
         self.allowed_file_globs = allowed_file_globs or []
 
         self.ssh_hostname = ssh_hostname
         self.ssh_username = ssh_username
         self.ssh_port = ssh_port
+        self.check_host_keys = check_host_keys
 
         if (ssh_hostname or ssh_port) and not connection_spec:
             self.connection_spec = [
                 SSH(
                     hostname=(ssh_hostname or name),
                     port=(ssh_port or 22),
-                    username=(ssh_username or username)),
+                    username=(ssh_username or username),
+                    check_host_keys=check_host_keys,
+                ),
             ]
 
     def __hash__(self):
@@ -105,6 +111,10 @@ class Host:
         Allow child hosts to access any path matching `glob` on the host system.
         """
         self.allowed_file_globs.extend(globs)
+
+    @classmethod
+    def from_dict(cls, name: str, d: t.Dict[str, t.Any]):
+        return cls(name, **d)
 
 
 # `fscm.settings.sudo_password` value that is set here during remote child boot
@@ -228,7 +238,7 @@ class RemoteExecutor:
         """
         self._allowed_file_globs.extend(globs)
 
-    def set_secrets(self, secrets: SimpleNamespace):
+    def set_secrets(self, secrets: Secrets):
         for h in self.hosts:
             h.secrets = secrets
 

@@ -32,6 +32,7 @@ from string import Template
 from multiprocessing.pool import ThreadPool, AsyncResult
 
 from .thirdparty import color as c
+from .secrets import Secrets
 
 HAS_MITOGEN = True
 try:
@@ -113,6 +114,7 @@ class Settings:
             assert remote
             cached_from_remote = remote.CACHED_SUDO_PASSWORD
 
+        logger.debug("setting cached sudo password")
         return self.sudo_password or cached_from_remote
 
 
@@ -271,8 +273,8 @@ def cd(to_path):
 
 
 def get_secrets(
-    keys_needed: t.List[str], pass_key: t.Optional[str] = None
-) -> SimpleNamespace:
+    keys_needed: t.Optional[t.List[str]] = None, pass_key: t.Optional[str] = None
+) -> Secrets:
     """
     Load secrets, extract the necessary subset, and return them as a dict.
 
@@ -281,7 +283,9 @@ def get_secrets(
             store. Only pass what is necessary to a mitogen context.
     """
     sek = os.environ.get("FSCM_SECRETS")
-    out = SimpleNamespace()
+    ALL_KEYS = ['*']
+    keys_needed = keys_needed or ALL_KEYS
+    out = Secrets()
     if not sek and pass_key:
         settings.output.log(f"requesting secrets from {pass_key}")
         sek = run(f"pass show {pass_key}", quiet=True).assert_ok().stdout
@@ -297,14 +301,17 @@ def get_secrets(
 
     ns = _dict_into_ns(loaded)
 
-    for key in keys_needed:
-        _extract_namespace_subset(ns, key, out)
+    if keys_needed != ALL_KEYS:
+        for key in keys_needed:
+            _extract_namespace_subset(ns, key, out)
+    else:
+        out = ns
 
     return out
 
 
 def _dict_into_ns(d: dict):
-    ns = SimpleNamespace()
+    ns = Secrets()
 
     for k, v in d.items():
         if isinstance(v, dict):
@@ -315,14 +322,14 @@ def _dict_into_ns(d: dict):
     return ns
 
 
-def _extract_namespace_subset(orig: SimpleNamespace, key: str, newns: SimpleNamespace):
+def _extract_namespace_subset(orig: Secrets, key: str, newns: Secrets):
     k, *key_rest = key.split(".", 1)
     v = getattr(orig, k)
 
     if not getattr(newns, k, None):
         # Check to see if there's a value at the key so we don't overwrite common
         # key prefixes.
-        setattr(newns, k, SimpleNamespace())
+        setattr(newns, k, Secrets())
 
     if key_rest:
         _extract_namespace_subset(v, ".".join(key_rest), getattr(newns, k))
@@ -337,7 +344,7 @@ def _pytest_extract_dict_subset():
             "d": {"e": {"f": 1, "g": 6}},
         }
     )
-    newns = SimpleNamespace()
+    newns = Secrets()
 
     _extract_namespace_subset(orig, "a.b", newns)
     _extract_namespace_subset(orig, "a.c", newns)
@@ -346,10 +353,9 @@ def _pytest_extract_dict_subset():
     _extract_namespace_subset(orig, "d.e.f", newns)
     assert newns == _dict_into_ns({"a": {"b": 2, "c": 3}, "d": {"e": {"f": 1}}})
 
-    newns = SimpleNamespace()
+    newns = Secrets()
     _extract_namespace_subset(orig, "a", newns)
     assert newns == _dict_into_ns({"a": {"b": 2, "c": 3, "x": 2}})
-
 
 @dataclass
 class SymlinkAdd(Change):
