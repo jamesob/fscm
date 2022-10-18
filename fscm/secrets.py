@@ -1,13 +1,30 @@
 class Secrets:
-    def __init__(self, /, **kwargs):
+    def __init__(self, d=None, /, **kwargs):
+        if d:
+            self.__dict__.update(d)
         self.__dict__.update(kwargs)
 
     def __repr__(self):
         items = (f"{k}='***'" for k in self.__dict__)
         return "{}({})".format(type(self).__name__, ", ".join(items))
 
-    def update(self, secrets):
-        self.__dict__.update(secrets.__dict__)
+    def keys(self):
+        return self.__dict__.keys()
+
+    def __iter__(self):
+        return self.__dict__.__iter__()
+
+    def __getitem__(self, k):
+        return self.__dict__[k]
+
+    def __setitem__(self, *args, **kwargs):
+        return self.__dict__.__setitem__(*args, **kwargs)
+
+    def __contains__(self, *args, **kwargs):
+        return self.__dict__.__contains__(*args, **kwargs)
+
+    def update(self, d):
+        self.__dict__.update(d)
         return self
 
     def pop(self, key, default=None):
