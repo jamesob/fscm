@@ -3,6 +3,7 @@ import logging
 import inspect
 import os
 import typing as t
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from collections import Counter
@@ -246,40 +247,46 @@ class RemoteExecutor:
         """
         Ensure each host has a mitogen context attached to it, which facilitates
         a remote connection.
+
+        Connects to hosts concurrently.
         """
-        for host in self.hosts:
-            if host in self._host_to_context:
-                # Already connected
-                continue
+        with ThreadPoolExecutor(max_workers=24) as executor:
+            host_to_promise = {}
 
-            connspec = host.connection_spec
+            for host in self.hosts:
+                if host in self._host_to_context:
+                    # Already connected
+                    continue
 
-            if not connspec and (default_conn_spec := OPTIONS.default_connection_spec):
-                if callable(default_conn_spec):
-                    connspec = default_conn_spec(host)
-                else:
-                    connspec = default_conn_spec
+                connspec = host.connection_spec
 
-            assert connspec
+                if not connspec and (default_conn_spec := OPTIONS.default_connection_spec):
+                    if callable(default_conn_spec):
+                        connspec = default_conn_spec(host)
+                    else:
+                        connspec = default_conn_spec
 
-            for spec in connspec:
-                if isinstance(spec, SSH):
-                    if not getattr(spec, 'hostname', None):
-                        spec.hostname = host.name
-                    if not getattr(spec, 'username', None):
-                        spec.username = host.username
-                    if OPTIONS.check_host_keys is not None:
-                        spec.check_host_keys = OPTIONS.check_host_keys
+                assert connspec
 
-            log.info("connecting to host %s; may prompt for credentials", host.name)
-            # TODO probably try and do this in parallel?
-            try:
-                self._host_to_context[host] = get_context_from_spec(
-                    self.router, connspec
-                )
-            except Exception:
-                log.exception(f"failed to connect to %s", host)
-                raise
+                for spec in connspec:
+                    if isinstance(spec, SSH):
+                        if not getattr(spec, 'hostname', None):
+                            spec.hostname = host.name
+                        if not getattr(spec, 'username', None):
+                            spec.username = host.username
+                        if OPTIONS.check_host_keys is not None:
+                            spec.check_host_keys = OPTIONS.check_host_keys
+
+                log.info("connecting to host %s; may prompt for credentials", host.name)
+                host_to_promise[host] = executor.submit(
+                    get_context_from_spec, self.router, connspec)
+
+            for h, promise in host_to_promise.items():
+                try:
+                    self._host_to_context[h] = promise.result()
+                except Exception:
+                    log.exception("failed to connect to %s", h)
+                    raise
 
     def _call_for_each_host(
         self, fnc, *args, hosts: t.Optional[t.Sequence[Host]] = None, **kwargs
