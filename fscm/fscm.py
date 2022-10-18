@@ -1,6 +1,7 @@
 # TODO: figure out global default su strategy
 # TODO: "version control"-ish file backup option
 # TODO: document sudo requirement
+# TODO: generic hosts.yml parser, CLI app factory
 import os
 import hashlib
 import os.path
@@ -1003,9 +1004,9 @@ def file(
         tmp.write_text(content)
         set_perms(tmp)
 
-        run(f"mv {tmp} {path}", sudo=True)
+        run(f"mv {tmp} {path}", sudo=True).assert_ok()
     else:
-        run(f"touch {path}")
+        run(f"touch {path}").assert_ok()
         set_perms(path)
         # Important to set perms before we write the contents.
         path.write_text(content)
@@ -1389,20 +1390,19 @@ class Systemd:
         user: t.Optional[str] = None,
         working_directory: t.Optional[str] = None,
         sudo: bool = False,
+        contents: t.Optional[str] = None,
     ) -> ChangeList:
         """
         Install a very basic service unit at the user level.
         """
         changes: ChangeList = []
-        is_root = getpass.getuser() == 'root'
         user = user or getpass.getuser()
 
         working_directory_line = ''
         if working_directory:
             working_directory_line = f"WorkingDirectory = {working_directory}"
 
-
-        contents = dedent(
+        contents = contents or dedent(
             f"""
             [Unit]
             Description={description}
