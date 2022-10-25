@@ -5,3 +5,4 @@ __email__ = 'james.obeirne@pm.me'
 __version__ = '0.1.0'
 
 from .fscm import *
+from . import contrib

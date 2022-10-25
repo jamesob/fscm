@@ -22,6 +22,14 @@ import mitogen.parent
 
 log = logging.getLogger("fscm.remote")
 
+try:
+    import clii
+except ImportError:
+    pass
+else:
+    def make_cli():
+        cli = clii.App()
+
 
 # TODO: just duplicate the interface of the Router functions listed
 # in https://mitogen.networkgenomics.com/api.html.
@@ -70,6 +78,7 @@ class Host:
         ssh_hostname: t.Optional[str] = None,
         ssh_port: t.Optional[int] = None,
         ssh_username: t.Optional[str] = None,
+        ssh_identity_file: t.Optional[t.Union[str, Path]] = None,
         check_host_keys: str = 'enforce',
     ):
         """
@@ -89,6 +98,10 @@ class Host:
         self.ssh_hostname = ssh_hostname
         self.ssh_username = ssh_username
         self.ssh_port = ssh_port
+        self.ssh_identity_file = str(ssh_identity_file) if ssh_identity_file else None
+        if ssh_identity_file and not Path(ssh_identity_file).exists():
+            raise ValueError(f"SSH identity file {ssh_identity_file} doesn't exist")
+
         self.check_host_keys = check_host_keys
 
         if (ssh_hostname or ssh_port) and not connection_spec:
@@ -98,6 +111,7 @@ class Host:
                     port=(ssh_port or 22),
                     username=(ssh_username or username),
                     check_host_keys=check_host_keys,
+                    identity_file=self.ssh_identity_file,
                 ),
             ]
 
@@ -292,7 +306,7 @@ class RemoteExecutor:
         self, fnc, *args, hosts: t.Optional[t.Sequence[Host]] = None, **kwargs
     ) -> HostGroupCallResult:
         hosts = hosts if hosts is not None else self.hosts
-        result = HostGroupCallResult(self.hosts)
+        result = HostGroupCallResult(hosts)
         task_to_host = {}
         host_to_task = {}
         from_children = {}
@@ -394,7 +408,7 @@ class RemoteExecutor:
         if isinstance(msg, GetFileMsg):
             path = Path(msg.path)
             allowed_globs = self._allowed_file_globs + child_host.allowed_file_globs
-            if any(path.match(glob) for glob in allowed_globs):
+            if any(path.match(str(glob)) for glob in allowed_globs):
                 to_child.send(path.read_bytes())
             else:
                 return BadChildRequest(

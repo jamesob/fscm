@@ -142,6 +142,12 @@ class Change:
             prefix = c.red(c.bold(" -- "))
         elif name.endswith("Modify"):
             prefix = c.yellow(c.bold(" ±± "))
+        elif name.endswith("Restarted"):
+            prefix = c.yellow(c.bold(" ♻️  "))
+        if name.endswith("Started"):
+            prefix = c.green(c.bold(" ⬆️  "))
+        if name.endswith("Stopped"):
+            prefix = c.red(c.bold(" ⬇️  "))
 
         settings.output.log(prefix + self.msg.format(**self.__dict__))
 
@@ -211,7 +217,7 @@ class OutputStreamer(threading.Thread):
     def run(self):
         for line in iter(self.pipe_reader.readline, ""):
             if settings.stream_output and not self.quiet:
-                settings.output.cmd_run(line.rstrip("\n"), self.is_stdout)
+                settings.output.cmd_run(line.strip(), self.is_stdout)
             if self.capture:
                 self.lines.append(line)
 
@@ -254,6 +260,118 @@ class RunReturn:
         return cls(cp.args, cp.returncode, cp.stdout, cp.stderr)
 
 
+def run(
+    cmd: str, check: bool = False, quiet: bool = False, capture: bool = True, **kwargs
+) -> RunReturn:
+    """
+    Run a command, capturing output and in shell mode by default.
+
+    'q' is also a kwarg alias for quiet.
+    """
+    cmd = cmd.strip()
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("shell", True)
+
+    if "q" in kwargs:
+        quiet = bool(kwargs.pop("q"))
+
+    stdout = OutputStreamer(quiet=quiet, capture=capture)
+    stderr = OutputStreamer(is_stdout=False, quiet=quiet, capture=capture)
+    kwargs["stdout"] = stdout
+    kwargs["stderr"] = stderr
+
+    sudo = bool(kwargs.pop("sudo", False))
+    cached_sudo_password = None
+
+    if sudo:
+        settings.output.alert(f"running sudo: {cmd}")
+        if cached_sudo_password := settings.get_cached_sudo_password():
+            cmd = f'sudo -S -- bash -c "{cmd}"'
+            if "stdin" in kwargs:
+                raise ValueError("can't pass stdin when using sudo -S")
+            kwargs["stdin"] = subprocess.PIPE
+        else:
+            ensure_sudo(cmd)
+            cmd = f'sudo bash -c "{cmd}"'
+
+    r = None
+
+    if DEBUG:
+        logger.info(f"running command {cmd!r}")
+
+    start = time.time()
+
+    def to_s(s) -> str:
+        if isinstance(s, bytes):
+            return s.decode()
+        return s
+
+    with subprocess.Popen(cmd, **kwargs) as s:
+        if sudo and cached_sudo_password:
+            assert s.stdin
+            s.stdin.write(f"{cached_sudo_password}\n")
+            s.stdin.close()
+        stdout.close()
+        stderr.close()
+        stdout.join()
+        stderr.join()
+        s.wait()
+        r = RunReturn(
+            s.args,
+            s.returncode,
+            to_s("".join(stdout.lines)),
+            to_s("".join(stderr.lines)),
+        )
+
+    end = time.time()
+    totaltime = end - start
+
+    if totaltime > 0.1:
+        logger.debug("cmd %r took %.3f seconds", cmd, end - start)
+
+    if DEBUG:
+        CMD_TIMES[(time.time(), cmd)] = totaltime
+
+    if not r.ok:
+        if not quiet:
+            logger.warning(
+                "Command failed (code {}): {}\nstdout:\n{}\n\nstderr:{}\n".format(
+                    r.returncode, cmd, r.stdout, r.stderr
+                )
+            )
+
+        if check:
+            raise CommandFailure
+
+    return r
+
+
+def fails(cmd, *args, **kwargs) -> bool:
+    """Check silently if a command fails."""
+    kwargs.setdefault('q', True)
+    kwargs['check'] = False
+    return not run(cmd, *args, **kwargs).ok
+
+
+def getstdout(*args, **kwargs) -> str:
+    """A shorthand for quietly (by default) getting stdout from a shell command."""
+    kwargs.setdefault("quiet", True)
+    return run(*args, **kwargs).stdout.strip()
+
+
+def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
+    out = []
+
+    for cmd in _split_cmd_input(cmds):
+        r = run(cmd, **kwargs)
+        out.append(r)
+
+        if check and not r.ok:
+            break
+
+    return out
+
+
 def check_fail(cmd: str, *args, **kwargs) -> bool:
     """Return True if the command failed with a non-zero exit code."""
     kwargs["check"] = False
@@ -284,7 +402,7 @@ def get_secrets(
             store. Only pass what is necessary to a mitogen context.
     """
     sek = os.environ.get("FSCM_SECRETS")
-    ALL_KEYS = ['*']
+    ALL_KEYS = ["*"]
     keys_needed = keys_needed or ALL_KEYS
     out = Secrets()
     if not sek and pass_key:
@@ -358,6 +476,7 @@ def _pytest_extract_dict_subset():
     _extract_namespace_subset(orig, "a", newns)
     assert newns == _dict_into_ns({"a": {"b": 2, "c": 3, "x": 2}})
 
+
 @dataclass
 class SymlinkAdd(Change):
     target: str
@@ -391,7 +510,7 @@ class UnixSystem:
             if exists := file_exists_sudo(dest):
                 current_target = run(f"readlink {dest}", sudo=sudo).stdout or None
         else:
-            if exists := (dest := Path(dest)).exists():
+            if exists := ((dest := Path(dest)).exists() or dest.is_symlink()):
                 try:
                     current_target = dest.readlink()
                 except OSError:
@@ -412,14 +531,24 @@ class UnixSystem:
 
         return []
 
+    def group_member(self, user: str, group: str) -> ChangeList:
+        """Ensure a user's membership in a group."""
+        if group in run(f"groups {user}", quiet=True).stdout.split():
+            return []
+        run(f"usermod -aG {group} {user}", sudo=True)
+        return [cl(UserGroupAdd, user, group)]
+
     def is_installed(self, name: str) -> bool:
         return run(f"which {name}", quiet=True).ok
 
     def is_debian(self) -> bool:
-        return run("uname -a | grep Debian").ok
+        return Path('/etc/debian_version').exists()
 
     def is_ubuntu(self) -> bool:
         return run("uname -a | grep Ubuntu").ok
+
+    def is_arch(self) -> bool:
+        return Path("/etc/arch-release").exists()
 
 
 class SymlinkFailure(Exception):
@@ -455,23 +584,58 @@ class UserGroupAdd(Change):
     msg: str = "user {user} added to group {group_name}"
 
 
+class Arch(UnixSystem):
+    def pkg_is_installed(self, name: str) -> bool:
+        return run(f"pacman -Qi {name}", q=True).ok
+
+    def pkg_install(self, name: str, sudo: bool = True) -> ChangeList:
+        return self.pkgs_install(name, sudo)
+
+    def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
+        got = run(f"pacman -Qi {name}", q=True)
+        if not got.ok:
+            return None
+        [ver] = [i for i in got.stdout.splitlines() if i.startswith("Version")]
+        return ver.split(":", 1)[-1].strip()
+
+    def pkgs_install(self, *names, sudo: bool = True) -> ChangeList:
+        allnames = []
+        for n in names:
+            allnames.extend([i.strip() for i in n.split()])
+
+        uninstalled = [n for n in allnames if not self.pkg_is_installed(n)]
+        if not uninstalled:
+            return []
+
+        run(f"pacman -Syq --noconfirm {' '.join(uninstalled)}", sudo=sudo).assert_ok()
+
+        added = []
+        for n in uninstalled:
+            added.append(cl(PkgAdd, n, self.pkg_get_installed_version(n), "pacman"))
+        return added
+
+    def install_from_aur(self, command: str, git_url: str) -> ChangeList:
+        changes = []
+        if run(f"which {command}", q=True).ok:
+            return changes
+        [name] = re.search(r'/([^/]+)\.git', git_url).groups()
+        if not (repos := Path.home() / 'aur').exists():
+            changes.extend(mkdir(repos))
+
+        if not (git := repos / name).exists():
+            run(f"git clone {git_url} {git}")
+            changes.append(cl(FileAdd, git))
+
+        with cd(git):
+            run("git pull origin master")
+            ver = run("grep 'pkgver=' PKGBUILD | cut -d= -f2").stdout.strip()
+            run("makepkg -si --noconfirm")
+
+        changes.append(cl(PkgAdd, "command", ver, 'aur'))
+        return changes
+
+
 class Debian(UnixSystem):
-    def bootstrap(self, username, hostname):
-        """
-        Should be run outside of a mitogen context.
-
-        Get the bare-minimum on target host to be able to run mitogen.
-        """
-        ok = run(f'ssh {username}@{hostname} "which python3"', quiet=True).ok
-
-        if not ok:
-            settings.output.log(f"bootstrapping host {hostname!r}")
-            run(
-                f"ssh {username}@{hostname} "
-                '"sudo apt-get update; sudo apt install -y python3 apt"',
-                check=True,
-            )
-
     def pkg_is_installed(self, name: str) -> bool:
         ret = run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'", quiet=True)
 
@@ -565,21 +729,19 @@ class Debian(UnixSystem):
             sudo=True,
         )
 
-    def service_start(self, service_name: str, enable: bool = False, sudo: bool = True):
-        run("systemctl daemon-reload", sudo=sudo)
-        run(f"systemctl start {service_name}", sudo=sudo)
-        if enable:
-            run(f"systemctl enable {service_name}.service", sudo=sudo)
 
-    def group_member(self, user: str, group: str) -> ChangeList:
-        """Ensure a user's membership in a group."""
-        if group in run(f"groups {user}", quiet=True).stdout.split():
-            return []
-        run(f"usermod -aG {group} {user}", sudo=True)
-        return [cl(UserGroupAdd, user, group)]
+def detect_system():
+    s = UnixSystem()
+
+    if s.is_debian():
+        return Debian()
+    elif s.is_arch():
+        return Arch()
+    else:
+        raise RuntimeError("couldn't detect a support distro")
 
 
-system = Debian()
+system = detect_system()
 s = system
 
 
@@ -616,7 +778,7 @@ class Docker:
 
     def image_exists(self, name: str) -> bool:
         return run(
-            f'%s image list | grep "^{name} "' % settings.container_cmd, quiet=True
+            f'%s image list | grep "^{name} "' % settings.container_cmd, q=True
         ).ok
 
 
@@ -776,111 +938,6 @@ def chown(
         run(f"chown {flags} {owner} {path}", sudo=needs_sudo_w, check=True)
         return [cl(ChownModify, path, owner, curr_owner, flags)]
     return []
-
-
-def run(
-    cmd: str, check: bool = False, quiet: bool = False, capture: bool = True, **kwargs
-) -> RunReturn:
-    """
-    Run a command, capturing output and in shell mode by default.
-
-    'q' is also a kwarg alias for quiet.
-    """
-    cmd = cmd.strip()
-    kwargs.setdefault("text", True)
-    kwargs.setdefault("shell", True)
-
-    if "q" in kwargs:
-        quiet = bool(kwargs.pop("q"))
-
-    stdout = OutputStreamer(quiet=quiet, capture=capture)
-    stderr = OutputStreamer(is_stdout=False, quiet=quiet, capture=capture)
-    kwargs["stdout"] = stdout
-    kwargs["stderr"] = stderr
-
-    sudo = bool(kwargs.pop("sudo", False))
-    cached_sudo_password = None
-
-    if sudo:
-        settings.output.alert(f"running sudo: {cmd}")
-        if cached_sudo_password := settings.get_cached_sudo_password():
-            cmd = f'sudo -S -- bash -c "{cmd}"'
-            if "stdin" in kwargs:
-                raise ValueError("can't pass stdin when using sudo -S")
-            kwargs["stdin"] = subprocess.PIPE
-        else:
-            ensure_sudo(cmd)
-            cmd = f'sudo bash -c "{cmd}"'
-
-    r = None
-
-    if DEBUG:
-        logger.info(f"running command {cmd!r}")
-
-    start = time.time()
-
-    def to_s(s) -> str:
-        if isinstance(s, bytes):
-            return s.decode()
-        return s
-
-    with subprocess.Popen(cmd, **kwargs) as s:
-        if sudo and cached_sudo_password:
-            assert s.stdin
-            s.stdin.write(f"{cached_sudo_password}\n")
-            s.stdin.close()
-        stdout.close()
-        stderr.close()
-        stdout.join()
-        stderr.join()
-        s.wait()
-        r = RunReturn(
-            s.args,
-            s.returncode,
-            to_s("".join(stdout.lines)),
-            to_s("".join(stderr.lines)),
-        )
-
-    end = time.time()
-    totaltime = end - start
-
-    if totaltime > 0.1:
-        logger.debug("cmd %r took %.3f seconds", cmd, end - start)
-
-    if DEBUG:
-        CMD_TIMES[(time.time(), cmd)] = totaltime
-
-    if not r.ok:
-        if not quiet:
-            logger.warning(
-                "Command failed (code {}): {}\nstdout:\n{}\n\nstderr:{}\n".format(
-                    r.returncode, cmd, r.stdout, r.stderr
-                )
-            )
-
-        if check:
-            raise CommandFailure
-
-    return r
-
-
-def getstdout(*args, **kwargs) -> str:
-    """A shorthand for quietly (by default) getting stdout from a shell command."""
-    kwargs.setdefault("quiet", True)
-    return run(*args, **kwargs).stdout.strip()
-
-
-def runmany(cmds: CmdStrs, check: bool = True, **kwargs) -> t.List[RunReturn]:
-    out = []
-
-    for cmd in _split_cmd_input(cmds):
-        r = run(cmd, **kwargs)
-        out.append(r)
-
-        if check and not r.ok:
-            break
-
-    return out
 
 
 def ensure_sudo(for_cmd: str):
@@ -1398,7 +1455,7 @@ class Systemd:
         changes: ChangeList = []
         user = user or getpass.getuser()
 
-        working_directory_line = ''
+        working_directory_line = ""
         if working_directory:
             working_directory_line = f"WorkingDirectory = {working_directory}"
 
@@ -1419,67 +1476,89 @@ class Systemd:
         )
 
         user_dir = Path(f"/home/{user}/.config/systemd/user")
-        changes.extend(p(user_dir, sudo=sudo).mkdir().chown(f'{user}:{user}').changes)
+        changes.extend(p(user_dir, sudo=sudo).mkdir().chown(f"{user}:{user}").changes)
 
         service_change = (
             p(user_dir / f"{service_name}.service", sudo=sudo)
             .contents(contents)
-            .chown(f'{user}:{user}')
+            .chown(f"{user}:{user}")
             .chmod("600")
             .changes
         )
         changes.extend(service_change)
 
-        self.run_as_user(user, f"systemctl --user enable {service_name}.service").assert_ok()
+        self.run_as_user(
+            user, f"systemctl --user enable {service_name}.service"
+        ).assert_ok()
 
         is_running = self.is_service_running(service_name, as_user=user)
-        action = 'start'
+        action = "start"
         if service_change:
-            action = 'restart'
+            action = "restart"
 
         if service_change or not is_running:
             self.run_as_user(user, f"systemctl --user {action} {service_name}.service")
+            if action == "start":
+                changes.append(cl(ServiceStarted, service_name))
+            elif action == "restart":
+                changes.append(cl(ServiceRestarted, service_name))
 
         return changes
 
     def _user_flag(self, as_user: t.Optional[str] = None):
         as_user = as_user or getpass.getuser()
-        is_root = as_user == 'root'
-        return '--user' if not is_root else '--user'
+        is_root = as_user == "root"
+        return "--user" if not is_root else "--user"
 
-    def is_service_running(self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> bool:
-        return self.service_status(service_name, as_user, sudo=sudo) == 'active'
+    def is_service_running(
+        self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False
+    ) -> bool:
+        return self.service_status(service_name, as_user, sudo=sudo) == "active"
 
-    def enable_service(self, service_name: str, start: bool = True, restart: bool = False, sudo: bool = False) -> ChangeList:
-        uflag = self._user_flag() if not sudo else ''
+    def enable_service(
+        self,
+        service_name: str,
+        start: bool = True,
+        restart: bool = False,
+        sudo: bool = False,
+    ) -> ChangeList:
+        changes = []
+        uflag = self._user_flag() if not sudo else ""
 
-        status = run(f'systemctl {uflag} is-enabled {service_name}', quiet=True)
-        if 'disabled' in status.stdout or not status.ok:
-            run(f'systemctl {uflag} enable {service_name}', sudo=sudo).assert_ok()
+        status = run(f"systemctl {uflag} is-enabled {service_name}", quiet=True)
+        if "disabled" in status.stdout or not status.ok:
+            run(f"systemctl {uflag} enable {service_name}", sudo=sudo).assert_ok()
+            changes.append(cl(ServiceEnabled, service_name))
 
         is_running = self.is_service_running(service_name, sudo=sudo)
         if start and not is_running:
-            run(f'systemctl {uflag} start {service_name}', sudo=sudo).assert_ok()
+            run(f"systemctl {uflag} start {service_name}", sudo=sudo).assert_ok()
+            changes.append(cl(ServiceStarted, service_name))
         elif is_running and restart:
-            run(f'systemctl {uflag} restart {service_name}', sudo=sudo).assert_ok()
+            run(f"systemctl {uflag} restart {service_name}", sudo=sudo).assert_ok()
+            changes.append(cl(ServiceRestarted, service_name))
 
-        # TODO fill this changelist out
-        return []
+        return changes
 
-    def service_status(self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> str:
-        uf = self._user_flag(as_user) if not sudo else ''
+    def service_status(
+        self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False
+    ) -> str:
+        uf = self._user_flag(as_user) if not sudo else ""
         cmd = f"systemctl show {uf} {service_name} --no-page"
         info = self.run_as_user(as_user, cmd, quiet=True).assert_ok().stdout
 
-        infod = dict([i.split('=', 1) for i in info.splitlines()])
+        infod = dict([i.split("=", 1) for i in info.splitlines()])
 
-        if 'ActiveState' not in infod:
+        if "ActiveState" not in infod:
             print(infod)
-        return infod['ActiveState']
+        return infod["ActiveState"]
 
-    def restart_service(self, name: str, as_user: t.Optional[str] = None, sudo: bool = False) -> RunReturn:
-        uf = self._user_flag(as_user) if not sudo else ''
-        self.run_as_user(as_user, f'systemctl {uf} restart {name}')
+    def restart_service(
+        self, name: str, as_user: t.Optional[str] = None, sudo: bool = False
+    ) -> RunReturn:
+        uf = self._user_flag(as_user) if not sudo else ""
+        self.run_as_user(as_user, f"systemctl {uf} restart {name}")
+        changes.append(cl(ServiceRestarted, service_name))
 
     def run_as_user(self, user: str, cmd: str, *args, **kwargs) -> RunReturn:
         user = user or getpass.getuser()
@@ -1489,7 +1568,8 @@ class Systemd:
         # Per https://unix.stackexchange.com/q/245768
         env = (
             f'XDG_RUNTIME_DIR="/run/user/{uid}" '
-            f'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/{uid}/bus"')
+            f'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/{uid}/bus"'
+        )
 
         if needs_sudo:
             return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
