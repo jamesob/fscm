@@ -90,7 +90,7 @@ class OutputHandler:
 class Settings:
     """fscm-wide settings."""
 
-    stream_output: bool
+    stream_output: bool = True
     # If true, don't actually execute anything - make a best effort to log what we
     # would've done.
     # TODO
@@ -101,6 +101,9 @@ class Settings:
     # If specified, automatially piped into `sudo -S | [cmd]` for any command requiring
     # privilege escalation.
     sudo_password: t.Optional[str] = None
+
+    # If True, run `assert_ok()` on every RunReturn object.
+    run_safe: bool = False
 
     def __repr__(self):
         def hide(k, v):
@@ -119,9 +122,7 @@ class Settings:
         return self.sudo_password or cached_from_remote
 
 
-settings = Settings(
-    stream_output=True,
-)
+settings = Settings()
 
 
 @dataclass
@@ -248,8 +249,8 @@ class RunReturn:
 
     def assert_ok(self):
         if self.returncode != 0:
-            raise RuntimeError(
-                f"command failed unexpectedly (code {self.returncode})"
+            raise CommandFailure(
+                f"command failed unexpectedly (code {self.returncode})\n{self.args}"
                 f"\nstdout:\n{self.stdout}\n\n"
                 f"\nstderr:\n{self.stderr}\n"
             )
@@ -261,7 +262,7 @@ class RunReturn:
 
 
 def run(
-    cmd: str, check: bool = False, quiet: bool = False, capture: bool = True, **kwargs
+    cmd: str, quiet: bool = False, capture: bool = True, **kwargs
 ) -> RunReturn:
     """
     Run a command, capturing output and in shell mode by default.
@@ -271,6 +272,10 @@ def run(
     cmd = cmd.strip()
     kwargs.setdefault("text", True)
     kwargs.setdefault("shell", True)
+
+    safe = settings.run_safe
+    if 'check' in kwargs and not kwargs.pop('check'):
+        safe = False
 
     if "q" in kwargs:
         quiet = bool(kwargs.pop("q"))
@@ -340,8 +345,8 @@ def run(
                 )
             )
 
-        if check:
-            raise CommandFailure
+        if safe:
+            r.assert_ok()
 
     return r
 
@@ -637,7 +642,8 @@ class Arch(UnixSystem):
 
 class Debian(UnixSystem):
     def pkg_is_installed(self, name: str) -> bool:
-        ret = run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'", quiet=True)
+        ret = run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'",
+                  quiet=True, check=False)
 
         if not ret.ok:
             return False
@@ -980,7 +986,7 @@ def mkdir(
 
 
 def file_exists_sudo(path: t.Union[str, Path]):
-    return run(f"test -e {path}", quiet=True, sudo=True).ok
+    return run(f"test -e {path}", check=False, quiet=True, sudo=True).ok
 
 
 def file(
@@ -1145,9 +1151,10 @@ def lineinfile(
         return bool(re.search(p, line))
 
     def modify_line(old_line):
-        return (
+        modified = (
             content_or_func(old_line) if callable(content_or_func) else content_or_func
         )
+        return modified.rstrip('\n')
 
     if patt:
         for line in lines:
@@ -1525,7 +1532,7 @@ class Systemd:
         changes = []
         uflag = self._user_flag() if not sudo else ""
 
-        status = run(f"systemctl {uflag} is-enabled {service_name}", quiet=True)
+        status = run(f"systemctl {uflag} is-enabled {service_name}", check=False, quiet=True)
         if "disabled" in status.stdout or not status.ok:
             run(f"systemctl {uflag} enable {service_name}", sudo=sudo).assert_ok()
             changes.append(cl(ServiceEnabled, service_name))
