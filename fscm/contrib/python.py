@@ -63,7 +63,8 @@ def install_python3(version="3.11.0") -> ChangeList:
     run(f"cd {untarred} && make altinstall >/dev/null", sudo=True).assert_ok()
 
     binpath = Path("/usr/local/bin/python3")
-    run(f"rm {binpath}", sudo=True)
+    if binpath.exists():
+        run(f"rm {binpath}", sudo=True)
 
     run(
         f"update-alternatives --install {binpath} python3 "
