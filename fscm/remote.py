@@ -22,6 +22,10 @@ import mitogen.parent
 
 log = logging.getLogger("fscm.remote")
 
+# In seconds
+FSCM_REMOTE_TIMEOUT = os.environ.get('FSCM_REMOTE_TIMEOUT', 30)
+
+
 try:
     import clii
 except ImportError:
@@ -293,7 +297,7 @@ class RemoteExecutor:
 
                 log.info("connecting to host %s; may prompt for credentials", host.name)
                 host_to_promise[host] = executor.submit(
-                    get_context_from_spec, self.router, connspec)
+                    get_context_from_spec, self.router, connspec, host.name)
 
             for h, promise in host_to_promise.items():
                 try:
@@ -335,7 +339,7 @@ class RemoteExecutor:
         # Boot the children up to establish bidirectional communication.
         for from_child in from_children.values():
             try:
-                sender_to_kid = from_child.get(timeout=10).unpickle()
+                sender_to_kid = from_child.get(timeout=FSCM_REMOTE_TIMEOUT).unpickle()
             except mitogen.core.TimeoutError:
                 log.error("failed to boot communication with child %s", from_child)
                 return result
@@ -460,6 +464,7 @@ def context_from_spec(specs: t.List[MitogenConnection], **kwargs):
 def get_context_from_spec(
     router,
     specs: t.Iterable[MitogenConnection],
+    conn_name: str = None,
 ) -> mitogen.parent.Context:
     curr_context = None
 
@@ -487,7 +492,7 @@ def get_context_from_spec(
         if curr_context:
             kwargs["via"] = curr_context
 
-        curr_context = route_fnc(**kwargs)
+        curr_context = route_fnc(name=conn_name, **kwargs)
 
     assert curr_context
     return curr_context

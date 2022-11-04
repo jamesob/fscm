@@ -78,6 +78,8 @@ class OutputHandler:
         The format for streaming `run()` output as it happens, line by line.
         """
         if is_stdout:
+            # TODO: sometimes hits
+            #   BlockingIOError: [Errno 11] write could not complete without blocking
             print(f"    {c.blue(line)}", file=self.stream)
         else:
             print(f"    {c.red(line)}", file=self.stream)
