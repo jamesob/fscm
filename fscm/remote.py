@@ -2,6 +2,7 @@
 import logging
 import inspect
 import os
+from enum import Enum
 import typing as t
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -68,6 +69,11 @@ class Local(MitogenConnection):
 ConnSpec = t.Iterable[MitogenConnection]
 
 
+class BecomeMethod(str, Enum):
+    su = "su"
+    sudo = "sudo"
+
+
 class Host:
     """An individual host that will be provisioned to."""
 
@@ -84,6 +90,7 @@ class Host:
         ssh_username: t.Optional[str] = None,
         ssh_identity_file: t.Optional[t.Union[str, Path]] = None,
         check_host_keys: str = 'enforce',
+        become_method: t.Optional[BecomeMethod] = None,
     ):
         """
         Args:
@@ -107,6 +114,7 @@ class Host:
             raise ValueError(f"SSH identity file {ssh_identity_file} doesn't exist")
 
         self.check_host_keys = check_host_keys
+        self.become_method = become_method
 
         if (ssh_hostname or ssh_port) and not connection_spec:
             self.connection_spec = [
