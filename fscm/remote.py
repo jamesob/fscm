@@ -93,7 +93,7 @@ class Host:
         become_method: t.Optional[BecomeMethod] = None,
     ):
         """
-        Args:
+        Kwargs:
             secrets: secrets that are attached to the host.
             connection_spec: how to connect to this particular host.
             allowed_file_globs: files on the parent host that this host
@@ -142,6 +142,14 @@ class Host:
     @classmethod
     def from_dict(cls, name: str, d: t.Dict[str, t.Any]):
         return cls(name, **d)
+
+    def set_bastion(self, bastion: ConnSpec):
+        """
+        Prefix this ConnSpec to the host's connection spec. This
+        allows a bastion connection to be used without having to specify
+        the default SSH connspec.
+        """
+        self.connection_spec = list(bastion) + list(self.connection_spec)
 
 
 # `fscm.settings.sudo_password` value that is set here during remote child boot

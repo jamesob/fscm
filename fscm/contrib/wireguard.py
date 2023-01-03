@@ -17,7 +17,7 @@ class Peer:
     ip: IPv4Address
     pubkey: str
     endpoint: str
-    a: t.Optional[str] = None
+    a: t.Optional[t.Union[str, list, tuple]] = None
     dns: t.Optional[str] = None
 
 
@@ -172,6 +172,7 @@ def peer(host: WireguardHostType, wgs: dict[str, Server]):
                     .stdout
                 )
 
+            assert pubkey
             logger.info(f"setting pubkey for {wg}: {pubkey}")
             wg.pubkey = pubkey
 

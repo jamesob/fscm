@@ -22,7 +22,7 @@ import sys
 import tempfile
 import typing as t
 from textwrap import dedent
-from types import SimpleNamespace
+from functools import cached_property
 from contextlib import contextmanager
 from urllib.parse import unquote, urlparse
 import urllib.request
@@ -41,7 +41,7 @@ try:
 except ImportError:
     HAS_MITOGEN = False
 else:
-    from .remote import *
+    from .remote import *  # noqa
     from fscm import remote
 
 logger = logging.getLogger("fscm")
@@ -70,10 +70,10 @@ class OutputHandler:
 
     stream: t.TextIO = sys.stdout
 
-    def log(self, msg: str):
+    def log(self, msg: str) -> None:
         print(msg, flush=True, file=self.stream)
 
-    def cmd_run(self, line: str, is_stdout: bool):
+    def cmd_run(self, line: str, is_stdout: bool) -> None:
         """
         The format for streaming `run()` output as it happens, line by line.
         """
@@ -84,7 +84,7 @@ class OutputHandler:
         else:
             print(f"    {c.red(line)}", file=self.stream)
 
-    def alert(self, msg: str):
+    def alert(self, msg: str) -> None:
         self.log(c.cyan(c.bold(" !! ")) + msg)
 
 
@@ -107,8 +107,8 @@ class Settings:
     # If True, run `assert_ok()` on every RunReturn object.
     run_safe: bool = False
 
-    def __repr__(self):
-        def hide(k, v):
+    def __repr__(self) -> str:
+        def hide(k: str, v: str) -> str:
             return "[hidden]" if k in {"sudo_password"} else v
 
         attrs = ", ".join("%s=%r" % (k, hide(k, v)) for k, v in self.__dict__.items())
@@ -127,15 +127,15 @@ class Settings:
 settings = Settings()
 
 
-@dataclass
 class Change:
     # How this change is presented as human-readable text. Formatted with
     # `.format(**self.__dict__)`.
+    msg: str = ''
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.timestamp = datetime.datetime.now()
 
-    def output_log(self):
+    def output_log(self) -> None:
         prefix = c.bold(" -- ")
         name = self.__class__.__name__
 
@@ -159,7 +159,7 @@ ChangeList = list[Change]
 CHANGELIST = []
 
 
-def cl(ChangeCls, *args, **kwargs) -> Change:
+def cl(ChangeCls: t.Type[Change], *args: t.Any, **kwargs: t.Any) -> Change:
     """Create a Change, append it to the global changelist, and return it."""
     c = ChangeCls(*args, **kwargs)
     CHANGELIST.append(c)
@@ -210,14 +210,14 @@ class OutputStreamer(threading.Thread):
         self.pipe_reader = os.fdopen(self.fd_read)
         self.start()
         self.capture = capture
-        self.lines = []
+        self.lines: list[str] = []
         self.is_stdout = is_stdout
         self.quiet = quiet
 
-    def fileno(self):
+    def fileno(self) -> int:
         return self.fd_write
 
-    def run(self):
+    def run(self) -> None:
         for line in iter(self.pipe_reader.readline, ""):
             if settings.stream_output and not self.quiet:
                 settings.output.cmd_run(line.strip(), self.is_stdout)
@@ -226,7 +226,7 @@ class OutputStreamer(threading.Thread):
 
         self.pipe_reader.close()
 
-    def close(self):
+    def close(self) -> None:
         os.close(self.fd_write)
 
 
@@ -246,10 +246,10 @@ class RunReturn:
     stderr: str
 
     @property
-    def ok(self):
+    def ok(self) -> bool:
         return self.returncode == 0
 
-    def assert_ok(self):
+    def assert_ok(self) -> 'RunReturn':
         if self.returncode != 0:
             raise CommandFailure(
                 f"command failed unexpectedly (code {self.returncode})\n{self.args}"
@@ -259,12 +259,19 @@ class RunReturn:
         return self
 
     @classmethod
-    def from_std(cls, cp: subprocess.CompletedProcess):
+    def from_std(cls, cp: subprocess.CompletedProcess) -> 'RunReturn':
         return cls(cp.args, cp.returncode, cp.stdout, cp.stderr)
+
+    @cached_property
+    def to_change(self) -> CmdRun:
+        """Return a Change from this completed command."""
+        c = CmdRun(self.args, self)
+        CHANGELIST.append(c)
+        return c
 
 
 def run(
-    cmd: str, quiet: bool = False, capture: bool = True, **kwargs
+    cmd: str, quiet: bool = False, capture: bool = True, **kwargs: t.Any,
 ) -> RunReturn:
     """
     Run a command, capturing output and in shell mode by default.
@@ -308,7 +315,7 @@ def run(
 
     start = time.time()
 
-    def to_s(s) -> str:
+    def to_s(s: t.Union[str, bytes]) -> str:
         if isinstance(s, bytes):
             return s.decode()
         return s
@@ -324,7 +331,7 @@ def run(
         stderr.join()
         s.wait()
         r = RunReturn(
-            s.args,
+            str(s.args),
             s.returncode,
             to_s("".join(stdout.lines)),
             to_s("".join(stderr.lines)),
@@ -511,7 +518,7 @@ class UnixSystem:
         needs_sudo_for_read = need_sudo_to_read(dest)
         needs_sudo_for_write = need_sudo_to_write(dest)
         exists = None
-        current_target = None
+        current_target: t.Optional[str] = None
 
         if needs_sudo_for_read:
             if exists := file_exists_sudo(dest):
@@ -519,7 +526,7 @@ class UnixSystem:
         else:
             if exists := ((dest := Path(dest)).exists() or dest.is_symlink()):
                 try:
-                    current_target = dest.readlink()
+                    current_target = str(dest.readlink())
                 except OSError:
                     pass
 
@@ -529,12 +536,12 @@ class UnixSystem:
             if not exists:
                 run(f"ln {flags} {target} {dest}", sudo=needs_sudo_for_write)
                 return [cl(SymlinkAdd, str(target), str(dest))]
-            elif overwrite and current_target != target:
+            elif overwrite and current_target != str(target):
                 run(
                     f"rm {dest} && ln {flags} {target} {dest}",
                     sudo=needs_sudo_for_write,
                 )
-                return [cl(SymlinkModify, str(target), str(current_target), str(dest))]
+                return [cl(SymlinkModify, str(target), current_target, str(dest))]
 
         return []
 
@@ -552,7 +559,7 @@ class UnixSystem:
         return Path('/etc/debian_version').exists()
 
     def is_ubuntu(self) -> bool:
-        return run("uname -a | grep Ubuntu").ok
+        return run("uname -a | grep Ubuntu", check=False).ok
 
     def is_arch(self) -> bool:
         return Path("/etc/arch-release").exists()
@@ -622,10 +629,12 @@ class Arch(UnixSystem):
         return added
 
     def install_from_aur(self, command: str, git_url: str) -> ChangeList:
-        changes = []
+        changes: list[Change] = []
         if run(f"which {command}", q=True).ok:
             return changes
-        [name] = re.search(r'/([^/]+)\.git', git_url).groups()
+        match = re.search(r'/([^/]+)\.git', git_url)
+        assert match
+        [name] = match.groups()
         if not (repos := Path.home() / 'aur').exists():
             changes.extend(mkdir(repos))
 
@@ -721,8 +730,8 @@ class Debian(UnixSystem):
         changes.extend(self.pkg_install("software-properties-common"))
 
         if not Path(f"/etc/apt/sources.list.d/{source_created_str}").exists():
-            changes.extend(
-                run(f"add-apt-repository -y {repo_name}", check=True, sudo=sudo)
+            changes.append(
+                run(f"add-apt-repository -y {repo_name}", check=True, sudo=sudo).to_change
             )
 
             if keyname:
@@ -732,10 +741,10 @@ class Debian(UnixSystem):
         return changes
 
     def apt_add_key(self, keyname: str) -> ChangeList:
-        return run(
+        return [run(
             f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}",
             sudo=True,
-        )
+        ).to_change]
 
 
 def detect_system():
@@ -769,7 +778,7 @@ class Docker:
         return bool(vols)
 
     def create_volume(self, name: str) -> ChangeList:
-        return run(f"{settings.container_cmd} volume create {name}")
+        return [run(f"{settings.container_cmd} volume create {name}").to_change]
 
     def _find_container(self, name: str) -> RunReturn:
         return run(
@@ -797,8 +806,6 @@ docker = Docker()
 class PipPkgAdd(Change):
     pkg_name: str
     msg: str = "pip package added: {pkg_name}"
-
-
 @dataclass
 class Pip:
     """
@@ -994,11 +1001,12 @@ def file_exists_sudo(path: t.Union[str, Path]):
 def file(
     path: Pathable,
     content: t.Union[str, bytes, Path],
-    mode: str = None,
-    owner: str = None,
+    mode: t.Optional[str] = None,
+    owner: t.Optional[str] = None,
     sudo: bool = False,
 ) -> ChangeList:
-    path: Path = Path(path)
+    path: Path = Path(path)  # type: ignore
+    assert isinstance(path, Path)
     changes = []
 
     exists = False
@@ -1185,7 +1193,7 @@ def lineinfile(
 
                 # Line already exists in file as it should.
                 if len(lines) > i and lines[i] == mod_line:
-                    return False
+                    return []
 
                 newlines.extend([line, mod_line])
                 modified = True
@@ -1358,26 +1366,25 @@ def download_and_check_sha(url: str, sha256: str) -> Path:
 
 
 def print_slow_commands():
-    cmds = list(
-        reversed(sorted([(k[1], v) for k, v in CMD_TIMES.items()], key=lambda i: i[1]))
-    )
+    cmds = sorted(
+        [(k[1], v) for k, v in CMD_TIMES.items()], key=lambda i: i[1], reverse=True)
 
-    for cmd, time in cmds[:25]:
-        settings.output.log(f"{time:<20.2} {cmd:<30}")
+    for cmd, runtime in cmds[:25]:
+        settings.output.log(f"{runtime:<20.2} {cmd:<30}")
 
 
 @dataclass
 class PathHelper:
     path: Path
     sudo: t.Optional[bool] = None
-    changes: t.List[ChangeList] = field(default_factory=list)
+    changes: ChangeList = field(default_factory=list)
 
     def rm(self, flags: str = "", **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
 
         if self.path.exists():
             run(f"rm {flags} {self.path}", **kwargs)
-            self.changes.append([FileRm(str(self.path))])
+            self.changes.append(FileRm(str(self.path)))
         return self
 
     def contents(self, *args, **kwargs) -> "PathHelper":
@@ -1514,6 +1521,35 @@ class Systemd:
 
         return changes
 
+    def docker_compose_service(
+        self,
+        service_name,
+        description: str,
+        path: Pathable,
+        env: str = '',
+        docker_compose_path: str = '',
+    ) -> ChangeList:
+        docker_compose_path = (
+            docker_compose_path or run('which docker-compose').stdout.strip())
+        contents = dedent(f'''
+            [Unit]
+            Description={description}
+
+            [Service]
+            Type=oneshot
+            Environment={env}
+            WorkingDirectory={path}
+            RemainAfterExit=true
+
+            ExecStart={docker_compose_path} up -d --remove-orphans
+            ExecStop={docker_compose_path} rm -fs
+
+            [Install]
+            WantedBy=default.target
+            ''')
+        return self.user_service(
+            service_name, description, '', contents=contents)
+
     def _user_flag(self, as_user: t.Optional[str] = None):
         as_user = as_user or getpass.getuser()
         is_root = as_user == "root"
@@ -1562,14 +1598,7 @@ class Systemd:
             print(infod)
         return infod["ActiveState"]
 
-    def restart_service(
-        self, name: str, as_user: t.Optional[str] = None, sudo: bool = False
-    ) -> RunReturn:
-        uf = self._user_flag(as_user) if not sudo else ""
-        self.run_as_user(as_user, f"systemctl {uf} restart {name}")
-        changes.append(cl(ServiceRestarted, service_name))
-
-    def run_as_user(self, user: str, cmd: str, *args, **kwargs) -> RunReturn:
+    def run_as_user(self, user: t.Optional[str], cmd: str, *args, **kwargs) -> RunReturn:
         user = user or getpass.getuser()
         uid = pwd.getpwnam(user).pw_uid
         needs_sudo = getpass.getuser() != user

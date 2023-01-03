@@ -24,3 +24,25 @@ packages = ["fscm"]
 [tool.pytest.ini_options]
 python_functions = "_pytest*"
 python_files = ["fscm/fscm.py", "test_*.py"]
+
+[tool.ruff]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    # "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.mypy]
+strict = false
+
+[[tool.mypy.overrides]]
+module = "mitogen"
+ignore_missing_imports = true
