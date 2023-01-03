@@ -191,11 +191,11 @@ class HostGroupCallResult:
     failed: t.Dict[str, t.Any] = field(default_factory=dict)
 
     @property
-    def ok(self):
+    def ok(self) -> bool:
         return (not bool(self.failed)) and len(self.succeeded) == len(self.hosts)
 
     @property
-    def all_results(self):
+    def all_results(self) -> t.Dict[str, t.Any]:
         d = dict(self.succeeded)
         d.update(self.failed)
         return d

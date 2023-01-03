@@ -4,6 +4,9 @@ class Secrets:
             self.__dict__.update(d)
         self.__dict__.update(kwargs)
 
+    def __eq__(self, other):
+        return self.__dict__ == other.__dict__
+
     def __repr__(self):
         items = (f"{k}='***'" for k in self.__dict__)
         return "{}({})".format(type(self).__name__, ", ".join(items))
