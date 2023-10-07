@@ -76,13 +76,16 @@ class OutputHandler:
     def cmd_run(self, line: str, is_stdout: bool) -> None:
         """
         The format for streaming `run()` output as it happens, line by line.
+
+        FIXME this probably needs to be mutex'd when called from the OutputStreamer
+        threads. Queue?
         """
         if is_stdout:
             # TODO: sometimes hits
             #   BlockingIOError: [Errno 11] write could not complete without blocking
-            print(f"    {c.blue(line)}", file=self.stream)
+            print(f"    {c.blue(line)}", file=self.stream, flush=True)
         else:
-            print(f"    {c.red(line)}", file=self.stream)
+            print(f"    {c.red(line)}", file=self.stream, flush=True)
 
     def alert(self, msg: str) -> None:
         self.log(c.cyan(c.bold(" !! ")) + msg)
@@ -93,12 +96,8 @@ class Settings:
     """fscm-wide settings."""
 
     stream_output: bool = True
-    # If true, don't actually execute anything - make a best effort to log what we
-    # would've done.
-    # TODO
-    # dry: bool = False
     output: OutputHandler = field(default_factory=OutputHandler)
-    container_cmd: str = field(default="docker")
+    container_cmd: str = "docker"
 
     # If specified, automatially piped into `sudo -S | [cmd]` for any command requiring
     # privilege escalation.
@@ -106,6 +105,10 @@ class Settings:
 
     # If True, run `assert_ok()` on every RunReturn object.
     run_safe: bool = False
+
+    # If true, don't actually execute anything - make a best effort to log what we
+    # would've done.
+    dry_run: bool = False
 
     def __repr__(self) -> str:
         def hide(k: str, v: str) -> str:
@@ -130,7 +133,7 @@ settings = Settings()
 class Change:
     # How this change is presented as human-readable text. Formatted with
     # `.format(**self.__dict__)`.
-    msg: str = ''
+    msg: str = ""
 
     def __post_init__(self) -> None:
         self.timestamp = datetime.datetime.now()
@@ -152,7 +155,10 @@ class Change:
         if name.endswith("Stopped"):
             prefix = c.red(c.bold(" ⬇️  "))
 
-        settings.output.log(prefix + self.msg.format(**self.__dict__))
+        dry_prefix = ""
+        if settings.dry_run:
+            dry_prefix = "(dry) "
+        settings.output.log(dry_prefix + prefix + self.msg.format(**self.__dict__))
 
 
 ChangeList = list[Change]
@@ -249,7 +255,7 @@ class RunReturn:
     def ok(self) -> bool:
         return self.returncode == 0
 
-    def assert_ok(self) -> 'RunReturn':
+    def assert_ok(self) -> "RunReturn":
         if self.returncode != 0:
             raise CommandFailure(
                 f"command failed unexpectedly (code {self.returncode})\n{self.args}"
@@ -259,7 +265,7 @@ class RunReturn:
         return self
 
     @classmethod
-    def from_std(cls, cp: subprocess.CompletedProcess) -> 'RunReturn':
+    def from_std(cls, cp: subprocess.CompletedProcess) -> "RunReturn":
         return cls(cp.args, cp.returncode, cp.stdout, cp.stderr)
 
     @cached_property
@@ -271,7 +277,11 @@ class RunReturn:
 
 
 def run(
-    cmd: str, quiet: bool = False, capture: bool = True, **kwargs: t.Any,
+    cmd: str,
+    quiet: bool = False,
+    capture: bool = True,
+    destructive: bool = True,
+    **kwargs: t.Any,
 ) -> RunReturn:
     """
     Run a command, capturing output and in shell mode by default.
@@ -283,7 +293,7 @@ def run(
     kwargs.setdefault("shell", True)
 
     safe = settings.run_safe
-    if 'check' in kwargs and not kwargs.pop('check'):
+    if "check" in kwargs and not kwargs.pop("check"):
         safe = False
 
     if "q" in kwargs:
@@ -310,15 +320,17 @@ def run(
 
     r = None
 
-    if DEBUG:
+    if destructive and settings.dry_run:
+        settings.output.log(f"run '{cmd}'")
+        return RunReturn(cmd, 0, "", "")
+
+    elif DEBUG:
         logger.info(f"running command {cmd!r}")
 
     start = time.time()
 
     def to_s(s: t.Union[str, bytes]) -> str:
-        if isinstance(s, bytes):
-            return s.decode()
-        return s
+        return s.decode() if isinstance(s, bytes) else s
 
     with subprocess.Popen(cmd, **kwargs) as s:
         if sudo and cached_sudo_password:
@@ -362,8 +374,8 @@ def run(
 
 def fails(cmd, *args, **kwargs) -> bool:
     """Check silently if a command fails."""
-    kwargs.setdefault('q', True)
-    kwargs['check'] = False
+    kwargs.setdefault("q", True)
+    kwargs["check"] = False
     return not run(cmd, *args, **kwargs).ok
 
 
@@ -421,7 +433,11 @@ def get_secrets(
     out = Secrets()
     if not sek and pass_key:
         settings.output.log(f"requesting secrets from {pass_key}")
-        sek = run(f"pass show {pass_key}", quiet=True).assert_ok().stdout
+        sek = (
+            run(f"pass show {pass_key}", quiet=True, destructive=False)
+            .assert_ok()
+            .stdout
+        )
     assert sek
 
     try:
@@ -522,7 +538,9 @@ class UnixSystem:
 
         if needs_sudo_for_read:
             if exists := file_exists_sudo(dest):
-                current_target = run(f"readlink {dest}", sudo=sudo).stdout or None
+                current_target = (
+                    run(f"readlink {dest}", sudo=sudo, destructive=False).stdout or None
+                )
         else:
             if exists := ((dest := Path(dest)).exists() or dest.is_symlink()):
                 try:
@@ -547,19 +565,19 @@ class UnixSystem:
 
     def group_member(self, user: str, group: str) -> ChangeList:
         """Ensure a user's membership in a group."""
-        if group in run(f"groups {user}", quiet=True).stdout.split():
+        if group in run(f"groups {user}", quiet=True, destructive=False).stdout.split():
             return []
         run(f"usermod -aG {group} {user}", sudo=True)
         return [cl(UserGroupAdd, user, group)]
 
     def is_installed(self, name: str) -> bool:
-        return run(f"which {name}", quiet=True).ok
+        return run(f"which {name}", quiet=True, destructive=False).ok
 
     def is_debian(self) -> bool:
-        return Path('/etc/debian_version').exists()
+        return Path("/etc/debian_version").exists()
 
     def is_ubuntu(self) -> bool:
-        return run("uname -a | grep Ubuntu", check=False).ok
+        return run("uname -a | grep Ubuntu", check=False, destructive=False).ok
 
     def is_arch(self) -> bool:
         return Path("/etc/arch-release").exists()
@@ -600,22 +618,22 @@ class UserGroupAdd(Change):
 
 class Arch(UnixSystem):
     def pkg_is_installed(self, name: str) -> bool:
-        return run(f"pacman -Qi {name}", q=True).ok
+        return run(f"pacman -Qi {name}", q=True, destructive=False).ok
 
     def pkg_install(self, name: str, sudo: bool = True) -> ChangeList:
-        return self.pkgs_install(name, sudo)
+        return self.pkgs_install(name, sudo=sudo)
 
     def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
-        got = run(f"pacman -Qi {name}", q=True)
+        got = run(f"pacman -Qi {name}", q=True, destructive=False)
         if not got.ok:
             return None
         [ver] = [i for i in got.stdout.splitlines() if i.startswith("Version")]
         return ver.split(":", 1)[-1].strip()
 
-    def pkgs_install(self, *names, sudo: bool = True) -> ChangeList:
+    def pkgs_install(self, *names: t.Iterable[str], sudo: bool = True) -> ChangeList:
         allnames = []
         for n in names:
-            allnames.extend([i.strip() for i in n.split()])
+            allnames.extend([name.strip() for name in n.split()])
 
         uninstalled = [n for n in allnames if not self.pkg_is_installed(n)]
         if not uninstalled:
@@ -630,12 +648,12 @@ class Arch(UnixSystem):
 
     def install_from_aur(self, command: str, git_url: str) -> ChangeList:
         changes: list[Change] = []
-        if run(f"which {command}", q=True).ok:
+        if run(f"which {command}", q=True, destructive=False).ok:
             return changes
-        match = re.search(r'/([^/]+)\.git', git_url)
+        match = re.search(r"/([^/]+)\.git", git_url)
         assert match
         [name] = match.groups()
-        if not (repos := Path.home() / 'aur').exists():
+        if not (repos := Path.home() / "aur").exists():
             changes.extend(mkdir(repos))
 
         if not (git := repos / name).exists():
@@ -647,14 +665,18 @@ class Arch(UnixSystem):
             ver = run("grep 'pkgver=' PKGBUILD | cut -d= -f2").stdout.strip()
             run("makepkg -si --noconfirm")
 
-        changes.append(cl(PkgAdd, "command", ver, 'aur'))
+        changes.append(cl(PkgAdd, "command", ver, "aur"))
         return changes
 
 
 class Debian(UnixSystem):
     def pkg_is_installed(self, name: str) -> bool:
-        ret = run("dpkg-query -W -f='${Package},${Status}' " + f"'{name}'",
-                  quiet=True, check=False)
+        ret = run(
+            "dpkg-query -W -f='${Package},${Status}' " + f"'{name}'",
+            quiet=True,
+            check=False,
+            destructive=False,
+        )
 
         if not ret.ok:
             return False
@@ -682,7 +704,7 @@ class Debian(UnixSystem):
         return []
 
     def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
-        output = run(f'dpkg -s {name} | grep "^Version: "').stdout
+        output = run(f'dpkg -s {name} | grep "^Version: "', destructive=False).stdout
         if "Version: " not in output:
             return None
         return output.split("Version: ")[-1].strip()
@@ -731,7 +753,9 @@ class Debian(UnixSystem):
 
         if not Path(f"/etc/apt/sources.list.d/{source_created_str}").exists():
             changes.append(
-                run(f"add-apt-repository -y {repo_name}", check=True, sudo=sudo).to_change
+                run(
+                    f"add-apt-repository -y {repo_name}", check=True, sudo=sudo
+                ).to_change
             )
 
             if keyname:
@@ -741,10 +765,12 @@ class Debian(UnixSystem):
         return changes
 
     def apt_add_key(self, keyname: str) -> ChangeList:
-        return [run(
-            f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}",
-            sudo=True,
-        ).to_change]
+        return [
+            run(
+                f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {keyname}",
+                sudo=True,
+            ).to_change
+        ]
 
 
 def detect_system():
@@ -773,6 +799,7 @@ class Docker:
         vols = run(
             '%s volume ls --filter "name=%s"' % (settings.container_cmd, name),
             quiet=True,
+            destructive=False,
         ).stdout.strip()
 
         return bool(vols)
@@ -785,6 +812,7 @@ class Docker:
             '%s ps -a --filter "name=%s" --format "{{.Status}}"'
             % (settings.container_cmd, name),
             quiet=True,
+            destructive=False,
         )
 
     def is_container_up(self, name: str) -> bool:
@@ -795,7 +823,9 @@ class Docker:
 
     def image_exists(self, name: str) -> bool:
         return run(
-            f'%s image list | grep "^{name} "' % settings.container_cmd, q=True
+            f'%s image list | grep "^{name} "' % settings.container_cmd,
+            q=True,
+            destructive=False,
         ).ok
 
 
@@ -806,6 +836,8 @@ docker = Docker()
 class PipPkgAdd(Change):
     pkg_name: str
     msg: str = "pip package added: {pkg_name}"
+
+
 @dataclass
 class Pip:
     """
@@ -814,7 +846,7 @@ class Pip:
     """
 
     def pkg_is_installed(self, pkg_name: str) -> bool:
-        return not check_fail(f"pip show {pkg_name}")
+        return not check_fail(f"pip show {pkg_name}", destructive=False)
 
     def pkg_install(self, pkg_name: str) -> ChangeList:
         if self.pkg_is_installed(pkg_name):
@@ -853,7 +885,9 @@ def get_file_mode_user(path: Pathable) -> str:
 
 def get_file_mode_sudo(path: Pathable) -> str:
     """Returns a string like '700'."""
-    return run(f"stat -c '%a' {path}", quiet=True, sudo=True).stdout.strip()
+    return run(
+        f"stat -c '%a' {path}", quiet=True, sudo=True, destructive=False
+    ).stdout.strip()
 
 
 def get_file_mode(path: Pathable, sudo: bool = False) -> str:
@@ -941,7 +975,11 @@ def chown(
         raise NeedsSudoException(f"chown {path}")
 
     curr_owner = run(
-        f"stat -c '%U:%G' {path}", check=True, sudo=needs_sudo_r, quiet=True
+        f"stat -c '%U:%G' {path}",
+        check=True,
+        sudo=needs_sudo_r,
+        quiet=True,
+        destructive=False,
     ).stdout.strip()
 
     if ":" not in curr_owner:
@@ -957,7 +995,7 @@ def chown(
 
 def ensure_sudo(for_cmd: str):
     """Ensure we have sudo, prompting otherwise."""
-    if run("sudo -S true </dev/null", quiet=True).ok:
+    if run("sudo -S true </dev/null", quiet=True, destructive=False).ok:
         # Sudo is cached
         return
     settings.output.alert(f"requesting sudo for {for_cmd!r}")
@@ -995,7 +1033,9 @@ def mkdir(
 
 
 def file_exists_sudo(path: t.Union[str, Path]):
-    return run(f"test -e {path}", check=False, quiet=True, sudo=True).ok
+    return run(
+        f"test -e {path}", check=False, quiet=True, sudo=True, destructive=False
+    ).ok
 
 
 def file(
@@ -1045,7 +1085,7 @@ def file(
     if exists:
         txt = None
         if needs_sudo_r:
-            txt = run(f"cat {path}", sudo=True, quiet=True).stdout
+            txt = run(f"cat {path}", sudo=True, quiet=True, destructive=False).stdout
         else:
             txt = path.read_text()
 
@@ -1074,7 +1114,8 @@ def file(
 
     if sudo:
         tmp = _get_tempfile(path if exists else None, sudo)
-        tmp.write_text(content)
+        if not settings.dry_run:
+            tmp.write_text(content)
         set_perms(tmp)
 
         run(f"mv {tmp} {path}", sudo=True).assert_ok()
@@ -1082,7 +1123,8 @@ def file(
         run(f"touch {path}").assert_ok()
         set_perms(path)
         # Important to set perms before we write the contents.
-        path.write_text(content)
+        if not settings.dry_run:
+            path.write_text(content)
 
     if not exists:
         changes.append(cl(FileAdd, path))
@@ -1164,7 +1206,7 @@ def lineinfile(
         modified = (
             content_or_func(old_line) if callable(content_or_func) else content_or_func
         )
-        return modified.rstrip('\n')
+        return modified.rstrip("\n")
 
     if patt:
         for line in lines:
@@ -1203,9 +1245,11 @@ def lineinfile(
     if not modified:
         return []
 
-    tmp = _get_tempfile(target, sudo)
-    chmod(tmp, get_file_mode(path, sudo))
-    tmp.write_text("\n".join(newlines) + "\n")
+    tmp = Path("/tmp/file")
+    if not settings.dry_run:
+        tmp = _get_tempfile(target, sudo)
+        chmod(tmp, get_file_mode(path, sudo))
+        tmp.write_text("\n".join(newlines) + "\n")
 
     run(f"mv {tmp} {path}", sudo=sudo)
     if sudo:
@@ -1367,7 +1411,8 @@ def download_and_check_sha(url: str, sha256: str) -> Path:
 
 def print_slow_commands():
     cmds = sorted(
-        [(k[1], v) for k, v in CMD_TIMES.items()], key=lambda i: i[1], reverse=True)
+        [(k[1], v) for k, v in CMD_TIMES.items()], key=lambda i: i[1], reverse=True
+    )
 
     for cmd, runtime in cmds[:25]:
         settings.output.log(f"{runtime:<20.2} {cmd:<30}")
@@ -1497,7 +1542,7 @@ class Systemd:
         service_change = (
             p(user_dir / f"{service_name}.service", sudo=sudo)
             .contents(contents)
-            .chown(f"{user}:{user}")
+            .chown(f"{user}")
             .chmod("600")
             .changes
         )
@@ -1526,12 +1571,14 @@ class Systemd:
         service_name,
         description: str,
         path: Pathable,
-        env: str = '',
-        docker_compose_path: str = '',
+        env: str = "",
+        docker_compose_path: str = "",
     ) -> ChangeList:
         docker_compose_path = (
-            docker_compose_path or run('which docker-compose').stdout.strip())
-        contents = dedent(f'''
+            docker_compose_path or run("which docker-compose").stdout.strip()
+        )
+        contents = dedent(
+            f"""
             [Unit]
             Description={description}
 
@@ -1546,9 +1593,9 @@ class Systemd:
 
             [Install]
             WantedBy=default.target
-            ''')
-        return self.user_service(
-            service_name, description, '', contents=contents)
+            """
+        )
+        return self.user_service(service_name, description, "", contents=contents)
 
     def _user_flag(self, as_user: t.Optional[str] = None):
         as_user = as_user or getpass.getuser()
@@ -1570,7 +1617,9 @@ class Systemd:
         changes = []
         uflag = self._user_flag() if not sudo else ""
 
-        status = run(f"systemctl {uflag} is-enabled {service_name}", check=False, quiet=True)
+        status = run(
+            f"systemctl {uflag} is-enabled {service_name}", check=False, quiet=True
+        )
         if "disabled" in status.stdout or not status.ok:
             run(f"systemctl {uflag} enable {service_name}", sudo=sudo).assert_ok()
             changes.append(cl(ServiceEnabled, service_name))
@@ -1590,7 +1639,11 @@ class Systemd:
     ) -> str:
         uf = self._user_flag(as_user) if not sudo else ""
         cmd = f"systemctl show {uf} {service_name} --no-page"
-        info = self.run_as_user(as_user, cmd, quiet=True).assert_ok().stdout
+        info = (
+            self.run_as_user(as_user, cmd, quiet=True, destructive=False)
+            .assert_ok()
+            .stdout
+        )
 
         infod = dict([i.split("=", 1) for i in info.splitlines()])
 
@@ -1598,7 +1651,9 @@ class Systemd:
             print(infod)
         return infod["ActiveState"]
 
-    def run_as_user(self, user: t.Optional[str], cmd: str, *args, **kwargs) -> RunReturn:
+    def run_as_user(
+        self, user: t.Optional[str], cmd: str, *args, **kwargs
+    ) -> RunReturn:
         user = user or getpass.getuser()
         uid = pwd.getpwnam(user).pw_uid
         needs_sudo = getpass.getuser() != user

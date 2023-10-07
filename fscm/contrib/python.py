@@ -25,7 +25,7 @@ def install_python3(version="3.11.0") -> ChangeList:
 
     if s.is_installed("python3"):
         curr_version = _extract_version(
-            run("python3 --version", q=True).stdout.split("Python ")[-1]
+            run("python3 --version", q=True, destructive=False).stdout.split("Python ")[-1]
         )
         if curr_version >= vertuple:
             return []
