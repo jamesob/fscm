@@ -1,4 +1,4 @@
-FROM debian:latest
+FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y python3 openssh-server sudo && /usr/bin/ssh-keygen -A && \
   ( echo 'root:root' | chpasswd ) && \

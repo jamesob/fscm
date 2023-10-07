@@ -1,5 +1,6 @@
 import pytest
 import subprocess
+import typing as t
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -13,12 +14,12 @@ CONTAINER_NAME = 'fscm-test'
 fscm.remote.OPTIONS.pickle_whitelist = [r'tests\.integration\..+']
 
 
-def arch_container():
-    return boot_container('arch')
+def arch_container(**kwargs):
+    return boot_container('arch', **kwargs)
 
 
-def debian_container():
-    return boot_container('debian')
+def debian_container(**kwargs):
+    return boot_container('debian', **kwargs)
 
 
 def cleanup_container(check=True):
@@ -36,27 +37,15 @@ def test_identity_file() -> Path:
     return testdata_dir() / 'id-fscm-test'
 
 
-# -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-test_host = Host(
-    'test',
-    connection_spec=(
-        SSH(
-            hostname='localhost',
-            username='user',
-            port='2222',
-            identity_file=str(test_identity_file()),
-            check_host_keys='ignore',
-        ),
-    ),
-)
-
-
 @contextmanager
-def boot_container(distro):
+def boot_container(distro, ports: t.Optional[t.Iterable[str]] = None):
     cleanup_container(check=False)
+
+    extraports = ' '.join(f'-p {p}' for p in ports or [])
+
     proc = subprocess.run(
-        f"docker run -d --name {CONTAINER_NAME} -p {DOCKER_SSH_PORT}:22 "
-        f"jamesob/fscm-test-{distro}-ssh",
+        f"docker run -d --name {CONTAINER_NAME} {extraports} -p {DOCKER_SSH_PORT}:22 "
+        f"jamesob/fscm-test-ssh-{distro}",
         shell=True)
 
     if proc.returncode != 0:
