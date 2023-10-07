@@ -77,7 +77,7 @@ class BecomeMethod(str, Enum):
 
 
 class Host:
-    """An individual host that will be provisioned to."""
+    """An individual host that will be executed on."""
 
     def __init__(
         self,
@@ -93,6 +93,7 @@ class Host:
         ssh_identity_file: t.Optional[t.Union[str, Path]] = None,
         check_host_keys: str = 'enforce',
         become_method: t.Optional[BecomeMethod] = None,
+        pythonpath: str = "/usr/bin/env python3",
     ) -> None:
         """
         Kwargs:
@@ -107,6 +108,7 @@ class Host:
         self.secrets = secrets or Secrets()
         self.connection_spec = connection_spec
         self.allowed_file_globs = allowed_file_globs or []
+        self.pythonpath = pythonpath
 
         self.ssh_hostname = ssh_hostname
         self.ssh_username = ssh_username
@@ -317,7 +319,7 @@ class RemoteExecutor:
 
                 log.info("connecting to host %s; may prompt for credentials", host.name)
                 host_to_promise[host] = executor.submit(
-                    get_context_from_spec, self.router, connspec, host.name)
+                    get_context_from_spec, self.router, connspec, host.name, pythonpath=host.pythonpath)
 
             for h, promise in host_to_promise.items():
                 try:
@@ -490,13 +492,15 @@ def context_from_spec(specs: t.List[MitogenConnection], **kwargs):
 def get_context_from_spec(
     router,
     specs: t.Iterable[MitogenConnection],
-    conn_name: str = None,
+    conn_name: t.Optional[str] = None,
+    pythonpath: t.Optional[str] = None,
 ) -> mitogen.parent.Context:
     curr_context = None
+    python = pythonpath.split() if pythonpath else ['/usr/bin/env', 'python3']
 
     for spec in specs:
         kwargs = {
-            "python_path": ["/usr/bin/env", "python3"],
+            "python_path": python,
         }
 
         if isinstance(spec, SSH):
