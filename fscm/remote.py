@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from string import Template
 
+import fscm
 from .secrets import Secrets
 
 import mitogen.master
@@ -20,18 +21,17 @@ import mitogen.utils
 import mitogen.select
 import mitogen.parent
 
-
 log = logging.getLogger("fscm.remote")
 
 # In seconds
 FSCM_REMOTE_TIMEOUT = os.environ.get('FSCM_REMOTE_TIMEOUT', 30)
-
 
 try:
     import clii
 except ImportError:
     pass
 else:
+
     def make_cli():
         cli = clii.App()
 
@@ -39,10 +39,12 @@ else:
 # TODO: just duplicate the interface of the Router functions listed
 # in https://mitogen.networkgenomics.com/api.html.
 class MitogenConnection(SimpleNamespace):
+
     def __hash__(self):
         return hash(str(self.__dict__))
 
     def __repr__(self):
+
         def hide(k, v):
             return "[hidden]" if k in {"password"} else v
 
@@ -91,7 +93,7 @@ class Host:
         ssh_identity_file: t.Optional[t.Union[str, Path]] = None,
         check_host_keys: str = 'enforce',
         become_method: t.Optional[BecomeMethod] = None,
-    ):
+    ) -> None:
         """
         Kwargs:
             secrets: secrets that are attached to the host.
@@ -174,13 +176,13 @@ OPTIONS = RemoteOptions()
 
 
 @contextmanager
-def executor(*hosts: Host):
+def executor(*hosts: Host, dry_run: bool = False):
     """
     Return a RemoteExecutor instance for a number of hosts; should be done in a context
     manager to handle the mitogen Router lifecycle.
     """
     with mitogen_router() as router:
-        hg = RemoteExecutor(hosts, router)
+        hg = RemoteExecutor(hosts, router, dry_run=dry_run)
         yield hg
 
 
@@ -229,6 +231,7 @@ class RemoteExecutor:
 
     hosts: t.List[Host]
     router: mitogen.master.Router
+    dry_run: bool = False
 
     # A cache of the mitogen contexts, e.g. an active SSH connection, per host.
     _host_to_context: t.Dict[Host, mitogen.parent.Context] = field(default_factory=dict)
@@ -294,7 +297,8 @@ class RemoteExecutor:
 
                 connspec = host.connection_spec
 
-                if not connspec and (default_conn_spec := OPTIONS.default_connection_spec):
+                if not connspec and (default_conn_spec :=
+                                     OPTIONS.default_connection_spec):
                     if callable(default_conn_spec):
                         connspec = default_conn_spec(host)
                     else:
@@ -323,8 +327,11 @@ class RemoteExecutor:
                     raise
 
     def _call_for_each_host(
-        self, fnc, *args, hosts: t.Optional[t.Sequence[Host]] = None, **kwargs
-    ) -> HostGroupCallResult:
+            self,
+            fnc,
+            *args,
+            hosts: t.Optional[t.Sequence[Host]] = None,
+            **kwargs) -> HostGroupCallResult:
         hosts = hosts if hosts is not None else self.hosts
         result = HostGroupCallResult(hosts)
         task_to_host = {}
@@ -345,8 +352,13 @@ class RemoteExecutor:
             receiver_to_child_host[from_child] = h
 
             task = self._host_to_context[h].call_async(
-                boot_child_and_call, h, from_child.to_sender(), fnc, *args, **kwargs
-            )
+                boot_child_and_call,
+                h,
+                from_child.to_sender(),
+                fnc,
+                *args,
+                dry_run=self.dry_run,
+                **kwargs)
             select_msg_from_child.add(from_child)
             task_to_host[task] = h
             host_to_task[h] = task
@@ -379,9 +391,9 @@ class RemoteExecutor:
                 child_host = receiver_to_child_host[child_recv]
                 msg = msg_from_child.data.unpickle()
 
-                if bad_request := self._handle_msg_from_child(
-                    child_host, to_children[child_recv], msg
-                ):
+                if bad_request := self._handle_msg_from_child(child_host,
+                                                              to_children[child_recv],
+                                                              msg):
                     log.warning(
                         "child host made a bad request: %s; terminating task",
                         bad_request,
@@ -420,21 +432,21 @@ class RemoteExecutor:
         return result
 
     def _handle_msg_from_child(
-        self, child_host: Host, to_child: mitogen.core.Sender, msg: RemoteMsg
-    ) -> t.Optional[BadChildRequest]:
+            self, child_host: Host, to_child: mitogen.core.Sender,
+            msg: RemoteMsg) -> t.Optional[BadChildRequest]:
         """
         Respond to an in-task remote message from a child host.
         """
         if isinstance(msg, GetFileMsg):
-            path = Path(msg.path)
+            path = Path(os.path.expanduser(msg.path))
             allowed_globs = self._allowed_file_globs + child_host.allowed_file_globs
+            allowed_globs += [os.path.expanduser(a) for a in allowed_globs]
             if any(path.match(str(glob)) for glob in allowed_globs):
                 to_child.send(path.read_bytes())
             else:
                 return BadChildRequest(
                     f"unauthorized request for file: {path}; "
-                    f"allowed paths are {allowed_globs}"
-                )
+                    f"allowed paths are {allowed_globs}")
         elif isinstance(msg, GetSecretMsg):
             secret_path = msg.name
             if isinstance(secret_path, str):
@@ -446,8 +458,7 @@ class RemoteExecutor:
                     sek = getattr(sek, component)
                 except AttributeError:
                     return BadChildRequest(
-                        f"bad secret path for host {child_host}: {secret_path}"
-                    )
+                        f"bad secret path for host {child_host}: {secret_path}")
 
             assert isinstance(sek, str)
             to_child.send(sek)
@@ -458,8 +469,7 @@ class RemoteExecutor:
 @contextmanager
 def mitogen_router():
     mitogen.core.set_pickle_whitelist(
-        [r"fscm\..+", r"__main__\..+", *OPTIONS.pickle_whitelist]
-    )
+        [r"fscm\..+", r"__main__\..+", *OPTIONS.pickle_whitelist])
     broker = mitogen.master.Broker()
     router = mitogen.master.Router(broker)
     log_level = os.environ.get('MITOGEN_LOG_LEVEL', 'INFO')
@@ -523,10 +533,8 @@ def mitogen_context(*args, **kwargs):
 def get_mitogen_context(router, hostname, *args, **kwargs):
     kwargs.setdefault("python_path", ["/usr/bin/env", "python3"])
     context = (
-        router.local(*args, **kwargs)
-        if hostname == "localhost"
-        else router.ssh(*args, hostname=hostname, **kwargs)
-    )
+        router.local(*args, **kwargs) if hostname == "localhost" else router.ssh(
+            *args, hostname=hostname, **kwargs))
     # router.enable_debug()
     return context
 
@@ -562,8 +570,7 @@ class Parent:
 
 
 def boot_child_and_call(
-    host: Host, to_parent: mitogen.core.Sender, fnc, *args, **kwargs
-):
+        host: Host, to_parent: mitogen.core.Sender, fnc, *args, dry_run: t.Optional[bool] = None, **kwargs):
     argspec = inspect.getfullargspec(fnc)
     parent = Parent.from_sender(to_parent)
     args = list(args)
@@ -573,6 +580,11 @@ def boot_child_and_call(
         # `fscm.Settings.get_cached_sudo_password()`.
         global CACHED_SUDO_PASSWORD
         CACHED_SUDO_PASSWORD = sudo_password
+
+    if dry_run is not None:
+        # If dry_run is requested, set it up once we're on the target host
+        # (i.e. this function).
+        fscm.settings.dry_run = dry_run
 
     if "host" in argspec.args:
         args.insert(argspec.args.index("host"), host)
