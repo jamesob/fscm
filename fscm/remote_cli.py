@@ -20,6 +20,7 @@ def default_load_secrets_fnc(secrets_path: str, hosts: list[Host]) -> Secrets:
     """
 
     secrets = fscm.get_secrets(['*'], secrets_path)
+    host_to_secrets = {}
 
     # TODO: formalize this "_hosts" map convention somewhere
     if '_hosts' in secrets:
@@ -28,14 +29,15 @@ def default_load_secrets_fnc(secrets_path: str, hosts: list[Host]) -> Secrets:
     for host in hosts:
         secrets_for_host = host_to_secrets.get(host.name, {})
         # Set all secrets on the host, plus any host-specific secrets.
-        host.secrets.update(secrets).update(secrets_for_host)
+        host.secrets.update(secrets)
+        host.secrets.update(secrets_for_host)
 
         # Inherit a general sudo password if one is provided.
         #
         # TODO: formalize this special case?
         if (general_sudo :=
                 host_to_secrets.get('sudo_password')) and not secrets_for_host:
-            host.secrets.sudo_password = general_sudo
+            host.secrets['sudo_password'] = general_sudo
 
     return secrets
 

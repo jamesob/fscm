@@ -1,7 +1,6 @@
 # TODO: figure out global default su strategy
 # TODO: "version control"-ish file backup option
 # TODO: document sudo requirement
-# TODO: generic hosts.yml parser, CLI app factory
 import os
 import hashlib
 import os.path
@@ -315,6 +314,7 @@ def run(
                 raise ValueError("can't pass stdin when using sudo -S")
             kwargs["stdin"] = subprocess.PIPE
         else:
+            logger.warning("Missing cached sudo password: did you forget to set `fscm.settings.sudo_password`?")
             ensure_sudo(cmd)
             cmd = f'sudo bash -c "{cmd}"'
 
@@ -464,26 +464,26 @@ def _dict_into_ns(d: dict):
 
     for k, v in d.items():
         if isinstance(v, dict):
-            setattr(ns, k, _dict_into_ns(v))
+            ns[k] = _dict_into_ns(v)
         else:
-            setattr(ns, k, v)
+            ns[k] = v
 
     return ns
 
 
 def _extract_namespace_subset(orig: Secrets, key: str, newns: Secrets):
     k, *key_rest = key.split(".", 1)
-    v = getattr(orig, k)
+    v = orig[k]
 
-    if not getattr(newns, k, None):
+    if not newns.get(k):
         # Check to see if there's a value at the key so we don't overwrite common
         # key prefixes.
-        setattr(newns, k, Secrets())
+        newns[k] = Secrets()
 
     if key_rest:
-        _extract_namespace_subset(v, ".".join(key_rest), getattr(newns, k))
+        _extract_namespace_subset(v, ".".join(key_rest), newns[k])
     else:
-        setattr(newns, k, v)
+        newns[k] = v
 
 
 def _pytest_extract_dict_subset():
@@ -1646,9 +1646,6 @@ class Systemd:
         )
 
         infod = dict([i.split("=", 1) for i in info.splitlines()])
-
-        if "ActiveState" not in infod:
-            print(infod)
         return infod["ActiveState"]
 
     def run_as_user(

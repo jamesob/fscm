@@ -579,7 +579,7 @@ def boot_child_and_call(
     parent = Parent.from_sender(to_parent)
     args = list(args)
 
-    if sudo_password := getattr(host.secrets, "sudo_password", None):
+    if sudo_password := host.secrets.get("sudo_password"):
         # This value will be detected and made use of in
         # `fscm.Settings.get_cached_sudo_password()`.
         global CACHED_SUDO_PASSWORD

@@ -32,6 +32,6 @@ if __name__ == "__main__":
 
     h1 = Host(hostname, username=username, connection_spec=(SSH(),))
     with executor(h1) as exec:
-        h1.secrets.sudo_password = sudo_password
+        h1.secrets['sudo_password'] = sudo_password
         exec.run(run_sudo_thing)
         exec.run(check_sudo_file)
