@@ -1719,12 +1719,19 @@ class Systemd:
             changes.append(cl(ServiceEnabled, service_name))
 
         is_running = self.is_service_running(service_name, sudo=sudo)
-        if now and not is_running:
-            run(f"systemctl {uflag} start {service_name}", sudo=sudo).assert_ok()
-            changes.append(cl(ServiceStarted, service_name))
-        elif is_running and restart:
-            run(f"systemctl {uflag} restart {service_name}", sudo=sudo).assert_ok()
-            changes.append(cl(ServiceRestarted, service_name))
+
+        try:
+            if now and not is_running:
+                run(f"systemctl {uflag} start {service_name}", sudo=sudo).assert_ok()
+                changes.append(cl(ServiceStarted, service_name))
+            elif is_running and restart:
+                run(f"systemctl {uflag} restart {service_name}", sudo=sudo).assert_ok()
+                changes.append(cl(ServiceRestarted, service_name))
+        except CommandFailure:
+            settings.output.log(
+                f"service {service_name} failed to start; journalctl says")
+            journalctl = run(f"journalctl {uflag} -u {service_name}", sudo=sudo).stdout
+            raise
 
         return changes
 
