@@ -1077,7 +1077,12 @@ def file(
         if sudo:
             exists = file_exists_sudo(path)
         else:
-            raise FscmException(f"can't detect file {path} without sudo")
+            # XXX if we're in dry mode and this file is to be created in a dir that
+            # doesn't yet exist, we'll think that we need sudo here.
+            if not settings.dry_run:
+                raise FscmException(f"can't detect file {path} without sudo")
+            else:
+                exists = False
     else:
         exists = path.exists()
 
