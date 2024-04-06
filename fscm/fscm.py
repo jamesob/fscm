@@ -1,6 +1,7 @@
 # TODO: figure out global default su strategy
 # TODO: "version control"-ish file backup option
 # TODO: document sudo requirement
+# TODO: strategies for handling failure to connect to a single host over SSH
 import os
 import hashlib
 import os.path
@@ -982,7 +983,7 @@ def chown(
         destructive=False,
     ).stdout.strip()
 
-    if ":" not in curr_owner:
+    if ":" not in owner:
         curr_owner = curr_owner.split(":", 1)[0]
 
     if curr_owner != owner:
@@ -1051,20 +1052,18 @@ def file(
 
     exists = False
 
-    if isinstance(content, bytes):
-        content = content.decode()
-
     if isinstance(content, Path):
         content = content.read_text()
 
-    assert isinstance(content, str)
+    assert isinstance(content, (bytes, str))
+    isbytes = isinstance(content, bytes)
 
     newline = "\n"
-    if isinstance(content, bytes):
-        newline = b"\n"
+    if isbytes:
+        newline = b"\n"  # type: ignore
 
-    if not content.endswith(newline):
-        content += newline
+    if not content.endswith(newline):  # type: ignore
+        content += newline  # type: ignore
 
     def set_perms(p: Pathable) -> ChangeList:
         cs = []
@@ -1083,13 +1082,15 @@ def file(
         exists = path.exists()
 
     if exists:
-        txt = None
+        txt: str | bytes | None = None
         if needs_sudo_r:
-            txt = run(f"cat {path}", sudo=True, quiet=True, destructive=False).stdout
+            txt = run(f"cat {path}",
+                text=(not isbytes), sudo=True, quiet=True, destructive=False).stdout
         else:
-            txt = path.read_text()
+            txt = path.read_bytes() if isbytes else path.read_text()
 
         assert txt is not None
+        assert type(txt) == type(content)
 
         changes.extend(set_perms(path))
 
@@ -1098,16 +1099,21 @@ def file(
             return changes
         logger.warn(f"path {path} already exists - overwriting")
 
-        diff = "".join(
-            difflib.unified_diff(
-                [f"{i}\n" for i in txt.splitlines()],
-                [f"{i}\n" for i in content.splitlines()],
-                fromfile="original",
-                tofile="new",
+        if isinstance(content, str) and isinstance(txt, str):
+            diff = "".join(
+                difflib.unified_diff(
+                    [f"{i}\n" for i in txt.splitlines()],
+                    [f"{i}\n" for i in content.splitlines()],
+                    fromfile="original",
+                    tofile="new",
+                )
             )
-        )
 
-        settings.output.log(f"  diff on {path}:\n{textwrap.indent(diff, '    ')}")
+            settings.output.log(f"  diff on {path}:\n{textwrap.indent(diff, '    ')}")
+        else:
+            diff = '[binary]'
+            settings.output.log(f"  diff on {path}: [binary]")
+
         changes.append(cl(FileModify, path, diff))
 
     # New file
@@ -1115,22 +1121,40 @@ def file(
     if sudo:
         tmp = _get_tempfile(path if exists else None, sudo)
         if not settings.dry_run:
-            tmp.write_text(content)
+            _write_to_file(str(tmp), content)
         set_perms(tmp)
 
-        run(f"mv {tmp} {path}", sudo=True).assert_ok()
+        _mv_file(tmp, path, sudo=True).assert_ok()
     else:
         run(f"touch {path}").assert_ok()
         set_perms(path)
         # Important to set perms before we write the contents.
         if not settings.dry_run:
-            path.write_text(content)
+            _write_to_file(str(path), content)
 
     if not exists:
         changes.append(cl(FileAdd, path))
 
     return changes
 
+
+def _mv_file(src, dest, *args, **kwargs) -> RunReturn:
+    # Ensure the mv is actually flushed - have seen errors with "Text file busy"
+    # when trying to execute recently moved files.
+    r = run(f'mv {src} {dest}', *args, **kwargs)
+    run('sync -f', *args, **kwargs).assert_ok()
+    return r
+
+
+def _write_to_file(filename: str | Path, content: str | bytes):
+    """
+    Path.write* has proven unreliable, so explicitly write file and flush buffers.
+    """
+    mode = 'w' if isinstance(content, str) else 'wb'
+    with open(filename, mode) as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
 
 # TODO remove this old name
 file_ = file
@@ -1249,9 +1273,9 @@ def lineinfile(
     if not settings.dry_run:
         tmp = _get_tempfile(target, sudo)
         chmod(tmp, get_file_mode(path, sudo))
-        tmp.write_text("\n".join(newlines) + "\n")
+        _write_to_file(tmp, "\n".join(newlines) + "\n")
 
-    run(f"mv {tmp} {path}", sudo=sudo)
+    _mv_file(tmp, path, sudo=sudo).assert_ok()
     if sudo:
         # TODO fix this
         run(f"chown root:root {path}", sudo=sudo)
@@ -1314,7 +1338,7 @@ def template(path: t.Union[str, Path], **kwargs) -> str:
 
 def this_dir_path(frame_idx=1) -> Path:
     """
-    Returns the path to the dir containing the file that calls this function
+    Returns the absolute path to the dir containing the file that calls this function
     (not the dir containing *this* file).
     """
     # This code needs to be duplicated (instead of caling this_file_path()
@@ -1427,10 +1451,13 @@ class PathHelper:
     def rm(self, flags: str = "", **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
 
-        if self.path.exists():
+        if self.exists():
             run(f"rm {flags} {self.path}", **kwargs)
             self.changes.append(FileRm(str(self.path)))
         return self
+
+    def exists(self) -> bool:
+        return self.path.exists()
 
     def contents(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
@@ -1448,6 +1475,11 @@ class PathHelper:
     def chown(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
         self.changes.extend(chown(self.path, *args, **kwargs))
+        return self
+
+    def make_executable(self, *args, **kwargs) -> "PathHelper":
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.extend(make_executable(self.path, *args, **kwargs))
         return self
 
     def mkdir(self, *args, **kwargs) -> "PathHelper":
@@ -1547,24 +1579,71 @@ class Systemd:
             .changes
         )
         changes.extend(service_change)
+        changes.extend(self._activate_service(user, service_name, bool(service_change)))
+        return changes
 
-        self.run_as_user(
-            user, f"systemctl --user enable {service_name}.service"
-        ).assert_ok()
+    def simple_service(
+        self,
+        service_name: str,
+        description: str,
+        exec_start_contents: str,
+        user: str = 'root',
+        working_directory: t.Optional[str] = None,
+        sudo: bool = True,
+        wanted_by: str = "multi-user.target",
+        contents: t.Optional[str] = None,
+    ) -> ChangeList:
+        """
+        Install a very basic service unit; by default at the root level.
+        """
+        changes: ChangeList = []
 
-        is_running = self.is_service_running(service_name, as_user=user)
-        action = "start"
-        if service_change:
-            action = "restart"
+        working_directory_line = ""
+        if working_directory:
+            working_directory_line = f"WorkingDirectory = {working_directory}"
 
-        if service_change or not is_running:
-            self.run_as_user(user, f"systemctl --user {action} {service_name}.service")
-            if action == "start":
-                changes.append(cl(ServiceStarted, service_name))
-            elif action == "restart":
-                changes.append(cl(ServiceRestarted, service_name))
+        contents = contents or dedent(
+            f"""
+            [Unit]
+            Description={description}
+
+            [Service]
+            Type=simple
+            StandardOutput=journal
+            ExecStart={exec_start_contents}
+            {working_directory_line}
+
+            [Install]
+            WantedBy={wanted_by}
+        """
+        )
+
+        if user == 'root':
+            conf_dir = Path("/etc/systemd/system")
+        else:
+            assert Path(f"/home/{user}").exists()
+            conf_dir = Path(f"/home/{user}/.config/systemd/user")
+            changes.extend(
+                p(conf_dir, sudo=sudo).mkdir().chown(f"{user}:{user}").changes)
+
+        service_changes = (
+            p(conf_dir / f"{service_name}.service", sudo=sudo)
+            .contents(contents)
+            .chown(f"{user}")
+            .chmod("650")
+            .changes
+        )
+        changes.extend(service_changes)
+        changes.extend(self._activate_service(user, service_name, bool(service_changes)))
 
         return changes
+
+    def _activate_service(self, user: str, service_name: str, has_changed: bool) -> ChangeList:
+        uflag = '--user' if user != 'root' else ''
+        if has_changed:
+            self.run_as_user(user, f"systemctl {uflag} daemon-reload").assert_ok()
+        return self.enable_service(
+            service_name, now=True, restart=has_changed, sudo=(user == 'root'))
 
     def docker_compose_service(
         self,
@@ -1574,9 +1653,18 @@ class Systemd:
         env: str = "",
         docker_compose_path: str = "",
     ) -> ChangeList:
-        docker_compose_path = (
-            docker_compose_path or run("which docker-compose").stdout.strip()
-        )
+        """Create a basic docker-compose service."""
+        if not docker_compose_path:
+            if run("docker compose --help", q=True).ok:
+                docker_compose_path = run(
+                    "which docker", q=True).stdout.strip() + " compose"
+            else:
+                docker_compose_path = run(
+                    "which docker-compose", q=True).stdout.strip()
+
+        if not docker_compose_path:
+            raise RuntimeError("docker compose not installed")
+
         contents = dedent(
             f"""
             [Unit]
@@ -1588,6 +1676,7 @@ class Systemd:
             WorkingDirectory={path}
             RemainAfterExit=true
 
+            ExecStartPre={docker_compose_path} pull
             ExecStart={docker_compose_path} up -d --remove-orphans
             ExecStop={docker_compose_path} rm -fs
 
@@ -1610,7 +1699,7 @@ class Systemd:
     def enable_service(
         self,
         service_name: str,
-        start: bool = True,
+        now: bool = True,
         restart: bool = False,
         sudo: bool = False,
     ) -> ChangeList:
@@ -1625,7 +1714,7 @@ class Systemd:
             changes.append(cl(ServiceEnabled, service_name))
 
         is_running = self.is_service_running(service_name, sudo=sudo)
-        if start and not is_running:
+        if now and not is_running:
             run(f"systemctl {uflag} start {service_name}", sudo=sudo).assert_ok()
             changes.append(cl(ServiceStarted, service_name))
         elif is_running and restart:
@@ -1633,6 +1722,14 @@ class Systemd:
             changes.append(cl(ServiceRestarted, service_name))
 
         return changes
+
+    def restart_service(
+        self,
+        service_name: str,
+        start: bool = True,
+        sudo: bool = False,
+    ) -> ChangeList:
+        return self.enable_service(service_name, start, restart=True, sudo=sudo)
 
     def service_status(
         self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False
@@ -1662,6 +1759,7 @@ class Systemd:
         )
 
         if needs_sudo:
+            kwargs['sudo'] = True
             return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
         else:
             return run(f"{env} {cmd}", *args, **kwargs)

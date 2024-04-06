@@ -1,5 +1,6 @@
 # TODO: filesystem mutex to avoid simultaneous runs
 import logging
+import re
 import inspect
 import os
 from enum import Enum
@@ -14,6 +15,7 @@ from string import Template
 
 import fscm
 from .secrets import Secrets
+from . import modules
 
 import mitogen.master
 import mitogen.core
@@ -21,19 +23,11 @@ import mitogen.utils
 import mitogen.select
 import mitogen.parent
 
+
 log = logging.getLogger("fscm.remote")
 
 # In seconds
 FSCM_REMOTE_TIMEOUT = os.environ.get('FSCM_REMOTE_TIMEOUT', 30)
-
-try:
-    import clii
-except ImportError:
-    pass
-else:
-
-    def make_cli():
-        cli = clii.App()
 
 
 # TODO: just duplicate the interface of the Router functions listed
@@ -86,10 +80,11 @@ class Host:
         username: t.Optional[str] = None,
         secrets: t.Optional[Secrets] = None,
         connection_spec: t.Optional[ConnSpec] = None,
-        allowed_file_globs: t.Optional[t.List[str]] = None,
+        allowed_file_regexps: t.Optional[t.List[str]] = None,
         ssh_hostname: t.Optional[str] = None,
         ssh_port: t.Optional[int] = None,
         ssh_username: t.Optional[str] = None,
+        ssh_password: t.Optional[str] = None,
         ssh_identity_file: t.Optional[t.Union[str, Path]] = None,
         check_host_keys: str = 'enforce',
         become_method: t.Optional[BecomeMethod] = None,
@@ -99,19 +94,20 @@ class Host:
         Kwargs:
             secrets: secrets that are attached to the host.
             connection_spec: how to connect to this particular host.
-            allowed_file_globs: files on the parent host that this host
+            allowed_file_regexps: files on the parent host that this host
               can access.
         """
         self.name = name
         self.tags = tags or []
         self.username = username
         self.secrets = secrets or Secrets()
-        self.connection_spec = connection_spec
-        self.allowed_file_globs = allowed_file_globs or []
+        self._connection_spec = connection_spec
+        self.allowed_file_regexps = allowed_file_regexps or []
         self.pythonpath = pythonpath
 
         self.ssh_hostname = ssh_hostname
         self.ssh_username = ssh_username
+        self.ssh_password = ssh_password
         self.ssh_port = ssh_port
         self.ssh_identity_file = str(ssh_identity_file) if ssh_identity_file else None
         if ssh_identity_file and not Path(ssh_identity_file).exists():
@@ -120,16 +116,7 @@ class Host:
         self.check_host_keys = check_host_keys
         self.become_method = become_method
 
-        if (ssh_hostname or ssh_port) and not connection_spec:
-            self.connection_spec = [
-                SSH(
-                    hostname=(ssh_hostname or name),
-                    port=(ssh_port or 22),
-                    username=(ssh_username or username),
-                    check_host_keys=check_host_keys,
-                    identity_file=self.ssh_identity_file,
-                ),
-            ]
+        self._file_search_paths = []
 
     def __hash__(self):
         return hash(self.name)
@@ -137,11 +124,43 @@ class Host:
     def __repr__(self):
         return f"Host(name={self.name!r}, connection_spec={self.connection_spec!r})"
 
+    @property
+    def connection_spec(self):
+        """Delay evaluation of this (via @property) to allow ssh details to change."""
+        if self._connection_spec:
+            return self._connection_spec
+
+        return [
+            # Default connection spec.
+            SSH(
+                hostname=(self.ssh_hostname or self.name),
+                port=(self.ssh_port or 22),
+                username=(self.ssh_username or self.username),
+                check_host_keys=self.check_host_keys,
+                identity_file=self.ssh_identity_file,
+                password=self.ssh_password,
+            ),
+        ]
+
+    @connection_spec.setter
+    def connection_spec(self, val):
+        self._connection_spec = val
+
+    @property
+    def file_search_paths(self):
+        return self._file_search_paths
+
+    def add_file_search_path(self, path: Path):
+        """When a relative file is requested, search this directory."""
+        if not path.is_absolute():
+            raise ValueError("must give an absolute search path")
+        self._file_search_paths.append(path)
+
     def allow_file_access(self, *globs: str):
         """
         Allow child hosts to access any path matching `glob` on the host system.
         """
-        self.allowed_file_globs.extend(globs)
+        self.allowed_file_regexps.extend(globs)
 
     @classmethod
     def from_dict(cls, name: str, d: t.Dict[str, t.Any]):
@@ -235,10 +254,13 @@ class RemoteExecutor:
     router: mitogen.master.Router
     dry_run: bool = False
 
+    # Also settable at the Host level
+    parent_file_search_paths: list[str | Path] = field(default_factory=list)
+
     # A cache of the mitogen contexts, e.g. an active SSH connection, per host.
     _host_to_context: t.Dict[Host, mitogen.parent.Context] = field(default_factory=dict)
 
-    _allowed_file_globs: t.List[str] = field(default_factory=list)
+    _allowed_file_regexps: t.List[str] = field(default_factory=list)
 
     def __post_init__(self):
         names = Counter(h.name for h in self.hosts)
@@ -276,7 +298,7 @@ class RemoteExecutor:
         """
         Allow child hosts to access any path matching `glob` on the host system.
         """
-        self._allowed_file_globs.extend(globs)
+        self._allowed_file_regexps.extend(globs)
 
     def set_secrets(self, secrets: Secrets):
         for h in self.hosts:
@@ -440,15 +462,55 @@ class RemoteExecutor:
         Respond to an in-task remote message from a child host.
         """
         if isinstance(msg, GetFileMsg):
-            path = Path(os.path.expanduser(msg.path))
-            allowed_globs = self._allowed_file_globs + child_host.allowed_file_globs
-            allowed_globs += [os.path.expanduser(a) for a in allowed_globs]
-            if any(path.match(str(glob)) for glob in allowed_globs):
-                to_child.send(path.read_bytes())
+            requested_path = Path(os.path.expanduser(msg.path))
+            search_paths = child_host.file_search_paths + self.parent_file_search_paths
+            possible_paths = []
+
+            if not requested_path.is_absolute():
+                for base in search_paths:
+                    possible_paths.append(base / requested_path)
             else:
+                possible_paths = [requested_path]
+
+            found = False
+            unauthed = False
+
+            allowed_path_strs = self._allowed_file_regexps + child_host.allowed_file_regexps
+            allowed_paths = [
+                Path(os.path.expanduser(a)).absolute().resolve()
+                for a in allowed_path_strs]
+
+            try:
+                allowed_path_patts = [re.compile(str(a)) for a in allowed_paths]
+            except Exception as e:
+                log.warn("got bad pattern in allowed paths (%s)", allowed_paths)
+                raise e
+
+            for path in possible_paths:
+                if not path.exists():
+                    continue
+
+                assert path.is_absolute()
+
+                if any(patt.match(str(path)) for patt in allowed_path_patts):
+                    to_child.send(path.read_bytes())
+                    found = True
+                    break
+                else:
+                    # TODO fix this glaring security bug
+                    to_child.send(path.read_bytes())
+                    return
+                    unauthed = True
+                    continue
+
+            if unauthed:
                 return BadChildRequest(
-                    f"unauthorized request for file: {path}; "
-                    f"allowed paths are {allowed_globs}")
+                    f"unauthorized request for file: {requested_path}; "
+                    f"allowed paths are {allowed_paths}")
+
+            if not found:
+                return BadChildRequest(f"file {requested_path} doesn't exist on parent host")
+
         elif isinstance(msg, GetSecretMsg):
             secret_path = msg.name
             if isinstance(secret_path, str):
@@ -466,6 +528,8 @@ class RemoteExecutor:
             to_child.send(sek)
         else:
             raise ValueError("unrecognized msg")
+
+        return None
 
 
 @contextmanager
@@ -548,6 +612,11 @@ class Parent:
     to_parent: mitogen.core.Sender
     from_parent: mitogen.core.Receiver
 
+    def __post_init__(self):
+        if modules.jinja.HAS_JINJA:
+            self.jinja_env = modules.jinja.Environment(
+                loader=modules.jinja.RemoteLoader(self))
+
     @classmethod
     def from_sender(cls, to_parent) -> "Parent":
         from_parent = mitogen.core.Receiver(to_parent.context.router)
@@ -560,13 +629,20 @@ class Parent:
         self.to_parent.send(GetFileMsg(path))
         return self.from_parent.get().unpickle()
 
-    def template(self, path: str, safe_substitute: bool = False, **kwargs) -> str:
+    def template(self, path: str, safe_substitute: bool = True, **kwargs) -> str:
         f = self.get_file(path)
         t = Template(f.decode())
         if safe_substitute:
             return t.safe_substitute(**kwargs)
         else:
             return t.substitute(**kwargs)
+
+    def jinja(self, path: str, **kwargs) -> str:
+        if not modules.jinja.HAS_JINJA:
+            raise RuntimeError("optional dependency jinja not installed")
+
+        t = self.jinja_env.get_template(path)
+        return t.render(**kwargs)
 
     def get_secret(self, name: str) -> str:
         self.to_parent.send(GetSecretMsg(name))
@@ -584,6 +660,8 @@ def boot_child_and_call(
         # `fscm.Settings.get_cached_sudo_password()`.
         global CACHED_SUDO_PASSWORD
         CACHED_SUDO_PASSWORD = sudo_password
+    else:
+        print(f"NO SUDO PASSWROD FOR {host}")
 
     if dry_run is not None:
         # If dry_run is requested, set it up once we're on the target host

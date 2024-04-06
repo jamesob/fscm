@@ -173,7 +173,7 @@ def peer(host: WireguardHostType, wgs: dict[str, Server]):
                 )
 
             assert pubkey
-            logger.info(f"setting pubkey for {wg}: {pubkey}")
+            logger.info(f"setting pubkey for {wg}:\n\n{pubkey}")
             wg.pubkey = pubkey
 
         server = wgs[wg.name]

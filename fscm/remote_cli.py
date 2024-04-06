@@ -102,15 +102,17 @@ class RemoteCliApp(clii.App):
         assert self.hosts_path
         hosts: list[Host] = self.deserialize_hosts(self.hosts_path)
 
-        if filter := self.args.host_filter:
+        if filter := getattr(self.args, 'host_filter', ''):
             hosts = [h for h in hosts if h.name if re.match(filter, h.name)]
 
-        if tags := self.args.tag_filter:
+        if tags := getattr(self.args, 'tag_filter', ''):
             tagslist = [t.strip() for t in tags.split(',')]
             hosts = [h for h in hosts if any(tag in h.tags for tag in tagslist)]
 
         if with_secrets and self.secrets_path:
             self.secrets = self.load_secrets_fnc(self.secrets_path, hosts)
+        else:
+            print("WARNING !!! did not load secrets")
 
         hosts = self.prepare_hosts_fnc(hosts, self.secrets)
         self._loaded_hosts = hosts
@@ -124,6 +126,10 @@ class RemoteCliApp(clii.App):
     def get_host(self, name: str) -> Host:
         return [h for h in self.get_hosts() if name == h.name][0]
 
+    def run_on_hostname(self, name: str, *args, **kwargs) -> remote.HostGroupCallResult:
+        host = self.get_host(name)
+        return self.run_on_hosts([host], *args, **kwargs)
+
     def run_on_all(self, *args, **kwargs) -> remote.HostGroupCallResult:
         with self.get_executor() as exec:
             return exec.run(*args, **kwargs)
@@ -132,6 +138,10 @@ class RemoteCliApp(clii.App):
         with self.get_executor(hosts=hosts) as exec:
             return exec.run(*args, **kwargs)
 
+    def run_on_host(self, host, *args, **kwargs) -> remote.HostGroupCallResult:
+        return self.run_on_hosts([host], *args, **kwargs)
+
     def get_executor(self, hosts: t.Optional[list[Host]] = None) -> t.ContextManager:
         hosts = hosts or self.get_hosts()
+        print(self.args)
         return remote.executor(*hosts, dry_run=self.args.dry_run)
