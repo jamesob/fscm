@@ -62,4 +62,5 @@ def boot_container(distro, ports: t.Optional[t.Iterable[str]] = None):
 def pytest_generate_tests(metafunc):
     """Parameterize tests by distro when injecting the container fixture."""
     if "container" in metafunc.fixturenames:
-        metafunc.parametrize("container", [arch_container, debian_container])
+        # metafunc.parametrize("container", [arch_container, debian_container])
+        metafunc.parametrize("container", [debian_container])

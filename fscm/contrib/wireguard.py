@@ -7,6 +7,7 @@ from ipaddress import IPv4Address
 
 import fscm
 from fscm import p, run, remote
+from fscm.modules import systemd
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ def server(
         .changes
     )
 
-    fscm.systemd.enable_service(f"wg-quick@{wg.name}", restart=bool(changed), sudo=True)
+    systemd.enable_service(f"wg-quick@{wg.name}", restart=bool(changed), sudo=True)
 
 
 def peer(host: WireguardHostType, wgs: dict[str, Server]):
@@ -183,7 +184,7 @@ def peer(host: WireguardHostType, wgs: dict[str, Server]):
             .changes
         )
 
-        fscm.systemd.enable_service(f"wg-quick@{wg.name}", restart=changed, sudo=True)
+        systemd.enable_service(f"wg-quick@{wg.name}", restart=changed, sudo=True)
 
 
 def peer_config(wgs: Server, wg: Peer) -> str:

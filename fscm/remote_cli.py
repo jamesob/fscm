@@ -55,7 +55,7 @@ class RemoteCliApp(clii.App):
     def __init__(
             self,
             *args,
-            hosts_path: t.Optional[str] = None,
+            hosts_path: t.Optional[t.Union[str, Path]] = None,
             secrets_path: t.Optional[str] = None,
             check_host_keys: t.Optional[str] = None,
             HostClass: t.Type = remote.Host,
@@ -143,5 +143,4 @@ class RemoteCliApp(clii.App):
 
     def get_executor(self, hosts: t.Optional[list[Host]] = None) -> t.ContextManager:
         hosts = hosts or self.get_hosts()
-        print(self.args)
         return remote.executor(*hosts, dry_run=self.args.dry_run)

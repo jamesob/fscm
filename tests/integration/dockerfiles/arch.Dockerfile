@@ -1,6 +1,7 @@
 FROM archlinux:latest
 
-RUN pacman -Syy && pacman -S --noconfirm python3 openssh sudo glibc && /usr/bin/ssh-keygen -A && \
+RUN sed -i 's/SigLevel = .*/SigLevel = Never/' /etc/pacman.conf && pacman --noconfirm -Syu && \
+  pacman -S --noconfirm python3 openssh sudo glibc && /usr/bin/ssh-keygen -A && \
   ( echo 'root:root' | chpasswd ) && \
   sed -i -e 's/^UsePAM yes/UsePAM no/g' /etc/ssh/sshd_config && \
   sed -i -e 's/.*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config && \

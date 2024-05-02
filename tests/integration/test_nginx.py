@@ -45,4 +45,4 @@ def pytest_nginx(container):
             got = exec.run(install_nginx)
 
         assert got.ok
-        # assert 'hello' in urllib.request.urlopen("http://localhost:8100").read()
+        assert 'hello' in urllib.request.urlopen("http://localhost:8100").read()

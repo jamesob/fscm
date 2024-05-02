@@ -13,15 +13,11 @@ import textwrap
 import threading
 import difflib
 import inspect
-import getpass
 import socket
-import datetime
 import logging
-import pwd
 import sys
 import tempfile
 import typing as t
-from textwrap import dedent
 from functools import cached_property
 from contextlib import contextmanager
 from urllib.parse import unquote, urlparse
@@ -32,17 +28,17 @@ from pathlib import Path, PurePosixPath
 from string import Template
 from multiprocessing.pool import ThreadPool, AsyncResult
 
+from .changes import Change, ChangeList
 from .thirdparty import color as c
 from .secrets import Secrets
 
+
+# I.e., is this installation of fscm remote-capable?
 HAS_MITOGEN = True
 try:
     import mitogen  # noqa
 except ImportError:
     HAS_MITOGEN = False
-else:
-    from .remote import *  # noqa
-    from fscm import remote
 
 logger = logging.getLogger("fscm")
 
@@ -120,7 +116,7 @@ class Settings:
     def get_cached_sudo_password(self) -> t.Optional[str]:
         cached_from_remote = None
         if HAS_MITOGEN:
-            assert remote
+            from . import remote
             cached_from_remote = remote.CACHED_SUDO_PASSWORD
 
         logger.debug("setting cached sudo password")
@@ -130,46 +126,38 @@ class Settings:
 settings = Settings()
 
 
-class Change:
-    # How this change is presented as human-readable text. Formatted with
-    # `.format(**self.__dict__)`.
-    msg: str = ""
-
-    def __post_init__(self) -> None:
-        self.timestamp = datetime.datetime.now()
-
-    def output_log(self) -> None:
-        prefix = c.bold(" -- ")
-        name = self.__class__.__name__
-
-        if name.endswith("Add"):
-            prefix = c.green(c.bold(" ++ "))
-        elif name.endswith("Rm"):
-            prefix = c.red(c.bold(" -- "))
-        elif name.endswith("Modify"):
-            prefix = c.yellow(c.bold(" ±± "))
-        elif name.endswith("Restarted"):
-            prefix = c.yellow(c.bold(" ♻️  "))
-        if name.endswith("Started"):
-            prefix = c.green(c.bold(" ⬆️  "))
-        if name.endswith("Stopped"):
-            prefix = c.red(c.bold(" ⬇️  "))
-
-        dry_prefix = ""
-        if settings.dry_run:
-            dry_prefix = "(dry) "
-        settings.output.log(dry_prefix + prefix + self.msg.format(**self.__dict__))
+# Global changelist for a particular invocation of `fscm`.
+CHANGELIST: ChangeList = []
 
 
-ChangeList = list[Change]
-CHANGELIST = []
+def log_change(change) -> None:
+    prefix = c.bold(" -- ")
+    name = change.__class__.__name__
+
+    if name.endswith("Add"):
+        prefix = c.green(c.bold(" ++ "))
+    elif name.endswith("Rm"):
+        prefix = c.red(c.bold(" -- "))
+    elif name.endswith("Modify"):
+        prefix = c.yellow(c.bold(" ±± "))
+    elif name.endswith("Restarted"):
+        prefix = c.yellow(c.bold(" ♻️  "))
+    if name.endswith("Started"):
+        prefix = c.green(c.bold(" ⬆️  "))
+    if name.endswith("Stopped"):
+        prefix = c.red(c.bold(" ⬇️  "))
+
+    dry_prefix = ""
+    if settings.dry_run:
+        dry_prefix = "(dry) "
+    settings.output.log(dry_prefix + prefix + change.msg.format(**change.__dict__))
 
 
 def cl(ChangeCls: t.Type[Change], *args: t.Any, **kwargs: t.Any) -> Change:
     """Create a Change, append it to the global changelist, and return it."""
     c = ChangeCls(*args, **kwargs)
     CHANGELIST.append(c)
-    c.output_log()
+    log_change(c)
     return c
 
 
@@ -213,6 +201,7 @@ class OutputStreamer(threading.Thread):
         super().__init__()
         self.daemon = False
         self.fd_read, self.fd_write = os.pipe()
+        # NOTE: fdopen reads strings by default.
         self.pipe_reader = os.fdopen(self.fd_read)
         self.start()
         self.capture = capture
@@ -248,8 +237,8 @@ class RunReturn:
 
     args: str
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: str | bytes
+    stderr: str | bytes
 
     @property
     def ok(self) -> bool:
@@ -276,6 +265,17 @@ class RunReturn:
         return c
 
 
+def run_ro(*args, **kwargs) -> RunReturn:
+    """
+    Run a "readonly" (i.e. non-destructive) command quietly.
+
+    Useful for, e.g. `which` invocations.
+    """
+    kwargs['destructive'] = False
+    kwargs['quiet'] = True
+    return run(*args, **kwargs)
+
+
 def run(
     cmd: str,
     quiet: bool = False,
@@ -286,15 +286,17 @@ def run(
     """
     Run a command, capturing output and in shell mode by default.
 
-    'q' is also a kwarg alias for quiet.
+    Unless quiet is passed, output will be streamed to stdout. If quiet is passed,
+    output is *still* captured unless `capture=False`.
+
+    Kwargs:
+        capture: whether or not to capture output streams into memory.
+        q: an alias for `quiet`
     """
     cmd = cmd.strip()
     kwargs.setdefault("text", True)
     kwargs.setdefault("shell", True)
-
-    safe = settings.run_safe
-    if "check" in kwargs and not kwargs.pop("check"):
-        safe = False
+    safe = kwargs.pop('check', settings.run_safe)
 
     if "q" in kwargs:
         quiet = bool(kwargs.pop("q"))
@@ -329,26 +331,29 @@ def run(
         logger.info(f"running command {cmd!r}")
 
     start = time.time()
-
-    def to_s(s: t.Union[str, bytes]) -> str:
-        return s.decode() if isinstance(s, bytes) else s
+    speaking_bytes = not kwargs.get('text')
 
     with subprocess.Popen(cmd, **kwargs) as s:
         if sudo and cached_sudo_password:
             assert s.stdin
-            s.stdin.write(f"{cached_sudo_password}\n")
+            if speaking_bytes:
+                s.stdin.write(cached_sudo_password.encode() + b"\n")
+            else:
+                s.stdin.write(f"{cached_sudo_password}\n")
             s.stdin.close()
         stdout.close()
         stderr.close()
         stdout.join()
         stderr.join()
         s.wait()
-        r = RunReturn(
-            str(s.args),
-            s.returncode,
-            to_s("".join(stdout.lines)),
-            to_s("".join(stderr.lines)),
-        )
+        outlines = "".join(stdout.lines)
+        errlines = "".join(stderr.lines)
+
+        if speaking_bytes:
+            outlines = outlines.encode()  # type: ignore
+            errlines = errlines.encode()  # type: ignore
+
+        r = RunReturn(str(s.args), s.returncode, outlines, errlines)
 
     end = time.time()
     totaltime = end - start
@@ -540,7 +545,7 @@ class UnixSystem:
         if needs_sudo_for_read:
             if exists := file_exists_sudo(dest):
                 current_target = (
-                    run(f"readlink {dest}", sudo=sudo, destructive=False).stdout or None
+                    run_ro(f"readlink {dest}", sudo=sudo).stdout or None
                 )
         else:
             if exists := ((dest := Path(dest)).exists() or dest.is_symlink()):
@@ -566,19 +571,19 @@ class UnixSystem:
 
     def group_member(self, user: str, group: str) -> ChangeList:
         """Ensure a user's membership in a group."""
-        if group in run(f"groups {user}", quiet=True, destructive=False).stdout.split():
+        if group in run_ro(f"groups {user}").stdout.split():
             return []
         run(f"usermod -aG {group} {user}", sudo=True)
         return [cl(UserGroupAdd, user, group)]
 
     def is_installed(self, name: str) -> bool:
-        return run(f"which {name}", quiet=True, destructive=False).ok
+        return run_ro(f"which {name}").ok
 
     def is_debian(self) -> bool:
         return Path("/etc/debian_version").exists()
 
     def is_ubuntu(self) -> bool:
-        return run("uname -a | grep Ubuntu", check=False, destructive=False).ok
+        return run_ro("uname -a | grep Ubuntu", check=False).ok
 
     def is_arch(self) -> bool:
         return Path("/etc/arch-release").exists()
@@ -619,13 +624,13 @@ class UserGroupAdd(Change):
 
 class Arch(UnixSystem):
     def pkg_is_installed(self, name: str) -> bool:
-        return run(f"pacman -Qi {name}", q=True, destructive=False).ok
+        return run_ro(f"pacman -Qi {name}").ok
 
     def pkg_install(self, name: str, sudo: bool = True) -> ChangeList:
         return self.pkgs_install(name, sudo=sudo)
 
     def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
-        got = run(f"pacman -Qi {name}", q=True, destructive=False)
+        got = run_ro(f"pacman -Qi {name}")
         if not got.ok:
             return None
         [ver] = [i for i in got.stdout.splitlines() if i.startswith("Version")]
@@ -649,7 +654,7 @@ class Arch(UnixSystem):
 
     def install_from_aur(self, command: str, git_url: str) -> ChangeList:
         changes: list[Change] = []
-        if run(f"which {command}", q=True, destructive=False).ok:
+        if run_ro(f"which {command}").ok:
             return changes
         match = re.search(r"/([^/]+)\.git", git_url)
         assert match
@@ -672,12 +677,8 @@ class Arch(UnixSystem):
 
 class Debian(UnixSystem):
     def pkg_is_installed(self, name: str) -> bool:
-        ret = run(
-            "dpkg-query -W -f='${Package},${Status}' " + f"'{name}'",
-            quiet=True,
-            check=False,
-            destructive=False,
-        )
+        ret = run_ro(
+            "dpkg-query -W -f='${Package},${Status}' " + f"'{name}'", check=False)
 
         if not ret.ok:
             return False
@@ -705,7 +706,7 @@ class Debian(UnixSystem):
         return []
 
     def pkg_get_installed_version(self, name: str) -> t.Optional[str]:
-        output = run(f'dpkg -s {name} | grep "^Version: "', destructive=False).stdout
+        output = run_ro(f'dpkg -s {name} | grep "^Version: "').stdout
         if "Version: " not in output:
             return None
         return output.split("Version: ")[-1].strip()
@@ -791,46 +792,6 @@ s = system
 
 def ln(*args, **kwargs) -> ChangeList:
     return s.link(*args, **kwargs)
-
-
-class Docker:
-    """Tested with podman also."""
-
-    def volume_exists(self, name: str) -> bool:
-        vols = run(
-            '%s volume ls --filter "name=%s"' % (settings.container_cmd, name),
-            quiet=True,
-            destructive=False,
-        ).stdout.strip()
-
-        return bool(vols)
-
-    def create_volume(self, name: str) -> ChangeList:
-        return [run(f"{settings.container_cmd} volume create {name}").to_change]
-
-    def _find_container(self, name: str) -> RunReturn:
-        return run(
-            '%s ps -a --filter "name=%s" --format "{{.Status}}"'
-            % (settings.container_cmd, name),
-            quiet=True,
-            destructive=False,
-        )
-
-    def is_container_up(self, name: str) -> bool:
-        return self._find_container(name).stdout.strip().startswith("Up ")
-
-    def container_exists(self, name: str) -> bool:
-        return bool(self._find_container(name).stdout.strip())
-
-    def image_exists(self, name: str) -> bool:
-        return run(
-            f'%s image list | grep "^{name} "' % settings.container_cmd,
-            q=True,
-            destructive=False,
-        ).ok
-
-
-docker = Docker()
 
 
 @dataclass
@@ -1039,6 +1000,10 @@ def file_exists_sudo(path: t.Union[str, Path]):
     ).ok
 
 
+class _SecretError(RuntimeError):
+    pass
+
+
 def file(
     path: Pathable,
     content: t.Union[str, bytes, Path],
@@ -1053,17 +1018,9 @@ def file(
     exists = False
 
     if isinstance(content, Path):
-        content = content.read_text()
+        content = content.read_bytes()
 
-    assert isinstance(content, (bytes, str))
-    isbytes = isinstance(content, bytes)
-
-    newline = "\n"
-    if isbytes:
-        newline = b"\n"  # type: ignore
-
-    if not content.endswith(newline):  # type: ignore
-        content += newline  # type: ignore
+    content_asbytes: bytes = content.encode() if isinstance(content, str) else content
 
     def set_perms(p: Pathable) -> ChangeList:
         cs = []
@@ -1087,37 +1044,52 @@ def file(
         exists = path.exists()
 
     if exists:
-        txt: str | bytes | None = None
+        existing_bytes: bytes | None = None
         if needs_sudo_r:
-            txt = run(f"cat {path}",
-                text=(not isbytes), sudo=True, quiet=True, destructive=False).stdout
+            existing_bytes = run(f"cat {path}",
+                text=False, sudo=True, quiet=True, destructive=False).stdout
         else:
-            txt = path.read_bytes() if isbytes else path.read_text()
+            existing_bytes = path.read_bytes()
 
-        assert txt is not None
-        assert type(txt) == type(content)
+        assert existing_bytes is not None
+        assert isinstance(existing_bytes, bytes)
 
         changes.extend(set_perms(path))
 
-        if txt == content:
+        if existing_bytes == content_asbytes:
             # No change
             return changes
         logger.warn(f"path {path} already exists - overwriting")
 
-        if isinstance(content, str) and isinstance(txt, str):
+        # If this isn't binary data, convert it to string so that it can be
+        # diffed and printed easily.
+        #
+        # XXX may not scale well with big files?
+        def tostr(s):
+            if isinstance(s, str):
+                return s
+            return s.decode('utf-8')
+
+        try:
             diff = "".join(
                 difflib.unified_diff(
-                    [f"{i}\n" for i in txt.splitlines()],
-                    [f"{i}\n" for i in content.splitlines()],
+                    [f"{i}\n" for i in tostr(existing_bytes).splitlines()],
+                    [f"{i}\n" for i in tostr(content_asbytes).splitlines()],
                     fromfile="original",
                     tofile="new",
                 )
             )
 
-            settings.output.log(f"  diff on {path}:\n{textwrap.indent(diff, '    ')}")
-        else:
+            if 'RSA PRIVATE KEY---' in diff:
+                raise _SecretError('rsa privkey')
+
+            settings.output.log(f"  diff on {path}:\n{diff}")
+        except UnicodeDecodeError:
             diff = '[binary]'
             settings.output.log(f"  diff on {path}: [binary]")
+        except _SecretError:
+            diff = '[secret]'
+            settings.output.log(f"  diff on {path}: [secret]")
 
         changes.append(cl(FileModify, path, diff))
 
@@ -1126,7 +1098,7 @@ def file(
     if sudo:
         tmp = _get_tempfile(path if exists else None, sudo)
         if not settings.dry_run:
-            _write_to_file(str(tmp), content)
+            _write_to_file(str(tmp), content_asbytes)
         set_perms(tmp)
 
         _mv_file(tmp, path, sudo=True).assert_ok()
@@ -1135,12 +1107,23 @@ def file(
         set_perms(path)
         # Important to set perms before we write the contents.
         if not settings.dry_run:
-            _write_to_file(str(path), content)
+            _write_to_file(str(path), content_asbytes)
 
     if not exists:
         changes.append(cl(FileAdd, path))
 
     return changes
+
+
+def is_printable_utf8(byte_array: bytes) -> str | bool:
+    try:
+        # Attempt to decode the byte array as UTF-8
+        decoded_str = byte_array.decode()
+        # Check if the decoded string is printable
+        return decoded_str.isprintable()
+    except UnicodeDecodeError:
+        # If decoding fails, it's not valid UTF-8 or contains unprintable characters
+        return False
 
 
 def _mv_file(src, dest, *args, **kwargs) -> RunReturn:
@@ -1453,6 +1436,13 @@ class PathHelper:
     sudo: t.Optional[bool] = None
     changes: ChangeList = field(default_factory=list)
 
+    def __getattr__(self, name):
+        """Proxy to the underlying Path instance if we don't have an attribute."""
+        try:
+            super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.path, name)
+
     def rm(self, flags: str = "", **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
 
@@ -1460,9 +1450,6 @@ class PathHelper:
             run(f"rm {flags} {self.path}", **kwargs)
             self.changes.append(FileRm(str(self.path)))
         return self
-
-    def exists(self) -> bool:
-        return self.path.exists()
 
     def contents(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
@@ -1500,281 +1487,3 @@ class PathHelper:
 
 def p(pathlike: t.Union[Path, str], *args, **kwargs) -> PathHelper:
     return PathHelper(Path(pathlike), *args, **kwargs)
-
-
-@dataclass
-class ServiceAdded(Change):
-    service_name: str
-    msg: str = "add service {service_name}"
-
-
-@dataclass
-class ServiceEnabled(Change):
-    service_name: str
-    msg: str = "enabled service {service_name}"
-
-
-@dataclass
-class ServiceStarted(Change):
-    service_name: str
-    msg: str = "started service {service_name}"
-
-
-@dataclass
-class ServiceRestarted(Change):
-    service_name: str
-    msg: str = "restarted service {service_name}"
-
-
-@dataclass
-class ServiceStopped(Change):
-    service_name: str
-    msg: str = "restarted service {service_name}"
-
-
-class Systemd:
-    """
-    Various utilities for working with systemd.
-    """
-
-    def user_service(
-        self,
-        service_name: str,
-        description: str,
-        exec_start_contents: str,
-        user: t.Optional[str] = None,
-        working_directory: t.Optional[str] = None,
-        sudo: bool = False,
-        contents: t.Optional[str] = None,
-    ) -> ChangeList:
-        """
-        Install a very basic service unit at the user level.
-        """
-        changes: ChangeList = []
-        user = user or getpass.getuser()
-
-        working_directory_line = ""
-        if working_directory:
-            working_directory_line = f"WorkingDirectory = {working_directory}"
-
-        contents = contents or dedent(
-            f"""
-            [Unit]
-            Description={description}
-
-            [Service]
-            Type=simple
-            StandardOutput=journal
-            ExecStart={exec_start_contents}
-            {working_directory_line}
-
-            [Install]
-            WantedBy=default.target
-        """
-        )
-
-        user_dir = Path(f"/home/{user}/.config/systemd/user")
-        changes.extend(p(user_dir, sudo=sudo).mkdir().chown(f"{user}:{user}").changes)
-
-        service_change = (
-            p(user_dir / f"{service_name}.service", sudo=sudo)
-            .contents(contents)
-            .chown(f"{user}")
-            .chmod("600")
-            .changes
-        )
-        changes.extend(service_change)
-        changes.extend(self._activate_service(user, service_name, bool(service_change)))
-        return changes
-
-    def simple_service(
-        self,
-        service_name: str,
-        description: str,
-        exec_start_contents: str,
-        user: str = 'root',
-        working_directory: t.Optional[str] = None,
-        sudo: bool = True,
-        wanted_by: str = "multi-user.target",
-        contents: t.Optional[str] = None,
-    ) -> ChangeList:
-        """
-        Install a very basic service unit; by default at the root level.
-        """
-        changes: ChangeList = []
-
-        working_directory_line = ""
-        if working_directory:
-            working_directory_line = f"WorkingDirectory = {working_directory}"
-
-        contents = contents or dedent(
-            f"""
-            [Unit]
-            Description={description}
-
-            [Service]
-            Type=simple
-            StandardOutput=journal
-            ExecStart={exec_start_contents}
-            {working_directory_line}
-
-            [Install]
-            WantedBy={wanted_by}
-        """
-        )
-
-        if user == 'root':
-            conf_dir = Path("/etc/systemd/system")
-        else:
-            assert Path(f"/home/{user}").exists()
-            conf_dir = Path(f"/home/{user}/.config/systemd/user")
-            changes.extend(
-                p(conf_dir, sudo=sudo).mkdir().chown(f"{user}:{user}").changes)
-
-        service_changes = (
-            p(conf_dir / f"{service_name}.service", sudo=sudo)
-            .contents(contents)
-            .chown(f"{user}")
-            .chmod("650")
-            .changes
-        )
-        changes.extend(service_changes)
-        changes.extend(self._activate_service(user, service_name, bool(service_changes)))
-
-        return changes
-
-    def _activate_service(self, user: str, service_name: str, has_changed: bool) -> ChangeList:
-        uflag = '--user' if user != 'root' else ''
-        if has_changed:
-            self.run_as_user(user, f"systemctl {uflag} daemon-reload").assert_ok()
-        return self.enable_service(
-            service_name, now=True, restart=has_changed, sudo=(user == 'root'))
-
-    def docker_compose_service(
-        self,
-        service_name,
-        description: str,
-        path: Pathable,
-        env: str = "",
-        docker_compose_path: str = "",
-    ) -> ChangeList:
-        """Create a basic docker-compose service."""
-        if not docker_compose_path:
-            if run("docker compose --help", q=True).ok:
-                docker_compose_path = run(
-                    "which docker", q=True).stdout.strip() + " compose"
-            else:
-                docker_compose_path = run(
-                    "which docker-compose", q=True).stdout.strip()
-
-        if not docker_compose_path:
-            raise RuntimeError("docker compose not installed")
-
-        contents = dedent(
-            f"""
-            [Unit]
-            Description={description}
-
-            [Service]
-            Type=oneshot
-            Environment={env}
-            WorkingDirectory={path}
-            RemainAfterExit=true
-
-            ExecStartPre={docker_compose_path} pull
-            ExecStart={docker_compose_path} up -d --remove-orphans
-            ExecStop={docker_compose_path} rm -fs
-
-            [Install]
-            WantedBy=default.target
-            """
-        )
-        return self.user_service(service_name, description, "", contents=contents)
-
-    def _user_flag(self, as_user: t.Optional[str] = None):
-        as_user = as_user or getpass.getuser()
-        is_root = as_user == "root"
-        return "--user" if not is_root else "--user"
-
-    def is_service_running(
-        self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False
-    ) -> bool:
-        return self.service_status(service_name, as_user, sudo=sudo) == "active"
-
-    def enable_service(
-        self,
-        service_name: str,
-        now: bool = True,
-        restart: bool = False,
-        sudo: bool = False,
-    ) -> ChangeList:
-        changes = []
-        uflag = self._user_flag() if not sudo else ""
-
-        status = run(
-            f"systemctl {uflag} is-enabled {service_name}", check=False, quiet=True
-        )
-        if "disabled" in status.stdout or not status.ok:
-            run(f"systemctl {uflag} enable {service_name}", sudo=sudo).assert_ok()
-            changes.append(cl(ServiceEnabled, service_name))
-
-        is_running = self.is_service_running(service_name, sudo=sudo)
-
-        try:
-            if now and not is_running:
-                run(f"systemctl {uflag} start {service_name}", sudo=sudo).assert_ok()
-                changes.append(cl(ServiceStarted, service_name))
-            elif is_running and restart:
-                run(f"systemctl {uflag} restart {service_name}", sudo=sudo).assert_ok()
-                changes.append(cl(ServiceRestarted, service_name))
-        except CommandFailure:
-            settings.output.log(
-                f"service {service_name} failed to start; journalctl says")
-            journalctl = run(f"journalctl {uflag} -u {service_name}", sudo=sudo).stdout
-            raise
-
-        return changes
-
-    def restart_service(
-        self,
-        service_name: str,
-        start: bool = True,
-        sudo: bool = False,
-    ) -> ChangeList:
-        return self.enable_service(service_name, start, restart=True, sudo=sudo)
-
-    def service_status(
-        self, service_name: str, as_user: t.Optional[str] = None, sudo: bool = False
-    ) -> str:
-        uf = self._user_flag(as_user) if not sudo else ""
-        cmd = f"systemctl show {uf} {service_name} --no-page"
-        info = (
-            self.run_as_user(as_user, cmd, quiet=True, destructive=False)
-            .assert_ok()
-            .stdout
-        )
-
-        infod = dict([i.split("=", 1) for i in info.splitlines()])
-        return infod["ActiveState"]
-
-    def run_as_user(
-        self, user: t.Optional[str], cmd: str, *args, **kwargs
-    ) -> RunReturn:
-        user = user or getpass.getuser()
-        uid = pwd.getpwnam(user).pw_uid
-        needs_sudo = getpass.getuser() != user
-
-        # Per https://unix.stackexchange.com/q/245768
-        env = (
-            f'XDG_RUNTIME_DIR="/run/user/{uid}" '
-            f'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/{uid}/bus"'
-        )
-
-        if needs_sudo:
-            kwargs['sudo'] = True
-            return run(f"sudo -i -u {user} {env} {cmd}", *args, **kwargs)
-        else:
-            return run(f"{env} {cmd}", *args, **kwargs)
-
-
-systemd = Systemd()
