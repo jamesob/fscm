@@ -51,7 +51,6 @@ class RemoteCliApp(clii.App):
     A clii.App subclass which provides common command-line flags (e.g. `--host-filter`,
     `--dry-run`) and utilities for running remotely executing commands.
     """
-
     def __init__(
             self,
             *args,
@@ -64,7 +63,7 @@ class RemoteCliApp(clii.App):
                                                      list[Host]]] = None,
             **kwargs) -> None:
         """
-        Kwargs:
+        Args:
             load_secrets_fnc: a function that appends secrets to each `Host.secrets`
                 from some source. Takes a path to the secrets and the list of loaded
                 hosts.

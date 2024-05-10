@@ -38,6 +38,8 @@ class ServiceRestarted(Change):
 class ServiceStopped(Change):
     service_name: str
     msg: str = "restarted service {service_name}"
+
+
 def user_simple_service(*args, **kwargs) -> ChangeList:
     """
     Install a very basic service unit at the user level.

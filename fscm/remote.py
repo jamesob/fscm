@@ -89,13 +89,18 @@ class Host:
         check_host_keys: str = 'enforce',
         become_method: t.Optional[BecomeMethod] = None,
         pythonpath: str = "/usr/bin/env python3",
+        skip_execution: bool = False,
     ) -> None:
         """
-        Kwargs:
+        Args:
             secrets: secrets that are attached to the host.
             connection_spec: how to connect to this particular host.
             allowed_file_regexps: files on the parent host that this host
-              can access.
+                can access.
+            skip_execution: If True, don't run anything on this host. This is
+                sometimes useful if you want to include an external host in
+                your inventory (e.g. for rendering Wireguard configurations) but
+                don't want to actually execute anything on it.
         """
         self.name = name
         self.tags = tags or []
@@ -104,6 +109,7 @@ class Host:
         self._connection_spec = connection_spec
         self.allowed_file_regexps = allowed_file_regexps or []
         self.pythonpath = pythonpath
+        self.skip_execution = skip_execution
 
         self.ssh_hostname = ssh_hostname
         self.ssh_username = ssh_username
@@ -243,6 +249,7 @@ class GetSecretMsg(RemoteMsg):
 
 @dataclass
 class BadChildRequest:
+    """A child (remote) host has made an invalid request of the parent."""
     msg: str
 
 
@@ -357,7 +364,15 @@ class RemoteExecutor:
             hosts: t.Optional[t.Sequence[Host]] = None,
             **kwargs) -> HostGroupCallResult:
         hosts = hosts if hosts is not None else self.hosts
-        result = HostGroupCallResult(hosts)
+        okay_hosts = []
+
+        for host in hosts:
+            if host.skip_execution:
+                log.info("skipping execution on host %s", host)
+                continue
+            okay_hosts.append(host)
+
+        result = HostGroupCallResult(okay_hosts)
         task_to_host = {}
         host_to_task = {}
         from_children = {}
@@ -369,7 +384,7 @@ class RemoteExecutor:
         self._connect_hosts()
 
         # Boot each host and get it started executing the task
-        for h in hosts:
+        for h in okay_hosts:
             assert h in self._host_to_context
             from_child = mitogen.core.Receiver(self.router)
             from_children[h] = from_child
