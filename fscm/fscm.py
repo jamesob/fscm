@@ -234,7 +234,6 @@ class RunReturn:
     """
     Wraps subprocess.CompletedProcess and adds convenience methods.
     """
-
     args: str
     returncode: int
     stdout: str | bytes
@@ -1477,6 +1476,11 @@ class PathHelper:
     def mkdir(self, *args, **kwargs) -> "PathHelper":
         kwargs = self._fill_default_kwargs(kwargs)
         self.changes.extend(mkdir(self.path, *args, **kwargs))
+        return self
+
+    def lineinfile(self, *args, **kwargs) -> "PathHelper":
+        kwargs = self._fill_default_kwargs(kwargs)
+        self.changes.extend(lineinfile(self.path, *args, **kwargs))
         return self
 
     def _fill_default_kwargs(self, kwargs: dict) -> dict:

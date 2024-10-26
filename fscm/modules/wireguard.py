@@ -30,6 +30,7 @@ class Server:
     pubkey: str
     interfaces: t.List[str]
     host: str
+    public_endpoint: str
     external_peers: t.Dict[str, str]
 
     @classmethod
@@ -41,8 +42,21 @@ class Server:
             pubkey=d["pubkey"],
             interfaces=d["interfaces"],
             host=d["host"],
+            public_endpoint=d["public_endpoint"],
             external_peers=d.get("external_peers", {}),
         )
+
+    @property
+    def external_peers_objs(self) -> dict[str, Peer]:
+        peers = {}
+
+        for name, pk_and_ip in self.external_peers.items():
+            if not pk_and_ip:
+                continue
+            pubkey, ip = [i.strip() for i in pk_and_ip.split(',')]
+            peers[name] = Peer(name, ip, pubkey, self.public_endpoint)
+
+        return peers
 
 
 class WireguardHostType(t.Protocol):
@@ -126,7 +140,6 @@ def wg_server_config(wg: Server, hosts: t.List[WireguardHostType]) -> str:
 
         conf += dedent(
             f"""
-
             [Peer]
             # {name}
             PublicKey = {pubkey}
@@ -189,11 +202,14 @@ def peer(host: WireguardHostType, wgs: dict[str, Server]):
 
 def peer_config(wgs: Server, wg: Peer) -> str:
     first_host = wgs.cidr.split("/")[0]
+    if not wgs.pubkey:
+        raise ValueError("wireguard server must have a pubkey assigned")
+
     return dedent(
         f"""
         [Interface]
         Address = {wg.ip}/32
-        PostUp = wg set %i private-key /etc/wireguard/{wg.name}-privkey
+        PostUp = wg set %i private-key /etc/wireguard/{wgs.name}-privkey
         PostUp = sleep 0.5; nc -nvuz {first_host} {wgs.port}
         {f'# DNS = {wg.dns}' if wg.dns else ''}
 

@@ -4,6 +4,7 @@ scripts on multiple hosts.
 """
 import typing as t
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -81,8 +82,6 @@ class RemoteCliApp(clii.App):
         self.secrets_path = secrets_path
         self.secrets = fscm.Secrets()
 
-        self._loaded_hosts: t.Optional[list[Host]] = None
-
         if check_host_keys:
             fscm.remote.OPTIONS.check_host_keys = check_host_keys
 
@@ -94,29 +93,25 @@ class RemoteCliApp(clii.App):
         data = yaml.safe_load(Path(hosts_path).read_text())
         return [self.HostClass.from_dict(name, d) for name, d in data['hosts'].items()]
 
-    def get_hosts(self, with_secrets: bool = True):
-        if self._loaded_hosts:
-            return self._loaded_hosts
-
+    @lru_cache(100)
+    def get_hosts(self, with_secrets: bool = True, getall: bool = False) -> list[Host]:
         assert self.hosts_path
         hosts: list[Host] = self.deserialize_hosts(self.hosts_path)
 
-        if filter := getattr(self.args, 'host_filter', ''):
-            hosts = [h for h in hosts if h.name if re.match(filter, h.name)]
+        if not getall:
+            if filter := getattr(self.args, 'host_filter', ''):
+                hosts = [h for h in hosts if h.name if re.match(filter, h.name)]
 
-        if tags := getattr(self.args, 'tag_filter', ''):
-            tagslist = [t.strip() for t in tags.split(',')]
-            hosts = [h for h in hosts if any(tag in h.tags for tag in tagslist)]
+            if tags := getattr(self.args, 'tag_filter', ''):
+                tagslist = [t.strip() for t in tags.split(',')]
+                hosts = [h for h in hosts if any(tag in h.tags for tag in tagslist)]
 
         if with_secrets and self.secrets_path:
             self.secrets = self.load_secrets_fnc(self.secrets_path, hosts)
         else:
             print("WARNING !!! did not load secrets")
 
-        hosts = self.prepare_hosts_fnc(hosts, self.secrets)
-        self._loaded_hosts = hosts
-
-        return self._loaded_hosts
+        return self.prepare_hosts_fnc(hosts, self.secrets)
 
     def get_hosts_by_tags(self, tags: str) -> list[Host]:
         tagslist = [t.strip() for t in tags.split(',')]
